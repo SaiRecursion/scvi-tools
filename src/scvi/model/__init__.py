@@ -7,6 +7,7 @@ from ._jaxscvi import JaxSCVI
 from ._linear_scvi import LinearSCVI
 from ._multivi import MULTIVI
 from ._peakvi import PEAKVI
+from ._phvi import PHVI
 from ._scanvi import SCANVI
 from ._scvi import SCVI
 from ._totalvi import TOTALVI
@@ -19,6 +20,7 @@ __all__ = [
     "AUTOZI",
     "SCANVI",
     "PEAKVI",
+    "PHVI",
     "CondSCVI",
     "DestVI",
     "MULTIVI",

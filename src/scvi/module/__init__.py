@@ -5,6 +5,7 @@ from ._jaxvae import JaxVAE
 from ._mrdeconv import MRDeconv
 from ._multivae import MULTIVAE
 from ._peakvae import PEAKVAE
+from ._phenovae import PhenoVAE
 from ._scanvae import SCANVAE
 from ._totalvae import TOTALVAE
 from ._vae import LDVAE, VAE
@@ -23,4 +24,5 @@ __all__ = [
     "MULTIVAE",
     "AmortizedLDAPyroModule",
     "JaxVAE",
+    "PhenoVAE",
 ]
