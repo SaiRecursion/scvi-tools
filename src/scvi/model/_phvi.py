@@ -215,7 +215,7 @@ class PHVI(
             )
             px = generative_outputs["px"]
             # Use mean of the distribution for denoised expression
-            denoised.append(px.loc.cpu().numpy())
+            denoised.append(px.loc.detach().cpu().numpy())
 
         return np.concatenate(denoised, axis=0)
 

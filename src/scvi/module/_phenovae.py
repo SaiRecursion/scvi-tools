@@ -287,7 +287,7 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         return LossOutput(
             loss=loss,
             reconstruction_loss=reconst_loss,
-            kl_local={MODULE_KEYS.KLD_KEY: kl_divergence_z},
+            kl_local={MODULE_KEYS.KL_Z_KEY: kl_divergence_z},
         )
 
     @torch.inference_mode()
