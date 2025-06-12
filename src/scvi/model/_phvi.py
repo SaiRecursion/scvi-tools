@@ -15,6 +15,7 @@ from scvi.data.fields import (
     LayerField,
     NumericalJointObsField,
 )
+from scvi.dataloaders import DataSplitter
 from scvi.model.base import EmbeddingMixin, UnsupervisedTrainingMixin
 from scvi.module import PhenoVAE
 from scvi.utils import setup_anndata_dsp
@@ -28,6 +29,69 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ==============================================================================
+# CORRECTED AND FINAL PHVIDataSplitter CLASS
+# ==============================================================================
+class PHVIDataSplitter(DataSplitter):
+    """
+    Custom DataSplitter for PHVI that respects control_only_training.
+    This version correctly handles empty validation sets.
+    """
+
+    def __init__(self, adata_manager, **kwargs):
+        # Pop our custom argument before passing to the parent __init__.
+        # This is a cleaner pattern than re-implementing the whole __init__.
+        self.control_only_training = kwargs.pop("control_only_training", False)
+        super().__init__(adata_manager, **kwargs)
+
+    def setup(self, stage=None):
+        """
+        Split indices in train/test/val sets.
+        If control_only_training, the train set is ONLY the control wells.
+        The val and test sets are split from the remaining non-control wells.
+        """
+        # First, let the parent class perform its default index splitting.
+        super().setup(stage)
+
+        # Now, if control_only_training is enabled, we override the splits.
+        if self.control_only_training:
+            adata = self.adata_manager.adata
+            if "is_training_well" not in adata.obs.columns:
+                logger.warning(
+                    "'is_training_well' column not found. Disabling control_only_training logic."
+                )
+                return
+
+            all_indices = np.arange(adata.n_obs)
+            control_indices = all_indices[adata.obs["is_training_well"].to_numpy(dtype=bool)]
+            
+            if len(control_indices) == 0:
+                raise ValueError("control_only_training is True but no control wells were found.")
+
+            # The training set is now exclusively the control wells.
+            self.train_idx = control_indices
+            logger.info(f"PHVI: Overriding training data with {len(self.train_idx)} control wells.")
+
+            # IMPORTANT: Since all wells in the training anndata are controls, the non-control
+            # set is empty. Therefore, the validation and test sets must also be empty.
+            self.val_idx = np.array([], dtype=int)
+            self.test_idx = np.array([], dtype=int)
+            logger.info("PHVI: Setting validation and test sets to empty for control-only training.")
+
+    def val_dataloader(self):
+        """
+        Override to prevent crashing when the validation set is empty.
+        """
+        # THE CRITICAL FIX: If val_idx is empty, return a valid, empty dataloader.
+        if len(self.val_idx) == 0:
+            return self.data_loader_cls(
+                self.adata_manager,
+                indices=self.val_idx, # Pass the empty array
+                batch_size=self.data_loader_kwargs.get("batch_size", 128)
+            )
+        # Otherwise, let the parent handle it.
+        return super().val_dataloader()
+
 
 class PHVI(
     EmbeddingMixin,
@@ -35,7 +99,11 @@ class PHVI(
     UnsupervisedTrainingMixin,
     BaseModelClass,
 ):
-    """Phenomics Variational Inference for continuous feature data.
+    """
+    Phenomics Variational Inference (PHVI) model.
+
+    This model is designed for phenomics data analysis, providing dimensionality
+    reduction and batch correction capabilities for high-dimensional phenotypic measurements.
 
     Parameters
     ----------
@@ -50,61 +118,62 @@ class PHVI(
     dropout_rate
         Dropout rate for neural networks.
     encode_covariates
-        If ``True``, covariates are concatenated to features prior to encoding.
+        Whether to concatenate covariates to expression in encoder.
     deeply_inject_covariates
-        If ``True`` and ``n_layers > 1``, covariates are concatenated to hidden layer outputs.
+        Whether to concatenate covariates into output of hidden layers in encoder/decoder.
     batch_representation
-        Method for encoding batch information. One of ``'one-hot'`` or ``'embedding'``.
+        One of the following:
+
+        * ``"embedding"`` - Embedding representation for batch.
+        * ``"one-hot"`` - One-hot representation for batch.
     condition_representation
-        Method for encoding condition information. One of ``'one-hot'`` or ``'embedding'``.
+        One of the following:
+
+        * ``"embedding"`` - Embedding representation for condition.
+        * ``"one-hot"`` - One-hot representation for condition.
     use_batch_norm
-        Specifies where to use batch normalization.
+        Whether to use batch normalization in layers.
     use_layer_norm
-        Specifies where to use layer normalization.
+        Whether to use layer normalization in layers.
     output_var_param
-        How to parameterize the output variance. One of:
-        
-        * ``'learned'``: learn a single variance parameter per feature
-        * ``'fixed'``: use a fixed variance of 1.0
-        * ``'feature'``: learn separate variance for each feature
-        * ``'conditional'``: learn variance conditioned on perturbation (for CVAE)
+        Output variance parameter for the decoder.
     control_only_training
-        If ``True``, training data is filtered to controls only.
-    **kwargs
-        Additional keyword arguments for :class:`~scvi.module.PhenoVAE`.
+        If True, train only on control wells while using all wells for inference.
+    **model_kwargs
+        Keyword args for :class:`~scvi.module.PhenoVAE`
 
     Examples
     --------
-    >>> from scvi.data import read_phenomics
-    >>> adata = read_phenomics("path/to/phenomics.parquet")
-    >>> scvi.model.PHVI.setup_anndata(adata, batch_key="hierarchical_batch", condition_key="condition")
+    >>> adata = scvi.data.synthetic_iid()
+    >>> scvi.model.PHVI.setup_anndata(adata, batch_key="batch")
     >>> vae = scvi.model.PHVI(adata)
     >>> vae.train()
-    >>> adata.obsm["X_PHVI"] = vae.get_latent_representation()
+    >>> adata.obsm["X_phvi"] = vae.get_latent_representation()
     """
 
     _module_cls = PhenoVAE
+    _data_splitter_cls = PHVIDataSplitter
 
     def __init__(
         self,
-        adata: AnnData | None = None,
-        registry: dict | None = None,
+        adata: AnnData,
         n_hidden: int = 128,
         n_latent: int = 10,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
-        encode_covariates: bool = False,
+        encode_covariates: bool = True,
         deeply_inject_covariates: bool = True,
-        batch_representation: Literal["one-hot", "embedding"] = "one-hot",
-        condition_representation: Literal["one-hot", "embedding"] = "embedding",
-        use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
-        use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
+        batch_representation: Literal["embedding", "one-hot"] = "one-hot",
+        condition_representation: Literal["embedding", "one-hot"] = "one-hot",
+        use_batch_norm: bool = True,
+        use_layer_norm: bool = False,
         output_var_param: Literal["learned", "fixed", "feature", "conditional"] = "learned",
         control_only_training: bool = False,
-        **kwargs,
+        **model_kwargs,
     ):
-        super().__init__(adata, registry)
+        super().__init__(adata)
 
+        # Store control_only_training for use in data splitting
         self.control_only_training = control_only_training
 
         self._module_kwargs = {
@@ -119,7 +188,7 @@ class PHVI(
             "use_batch_norm": use_batch_norm,
             "use_layer_norm": use_layer_norm,
             "output_var_param": output_var_param,
-            **kwargs,
+            **model_kwargs,
         }
         self._model_summary_string = (
             "PHVI model with the following parameters: \n"
@@ -193,10 +262,53 @@ class PHVI(
                 use_layer_norm=use_layer_norm,
                 output_var_param=output_var_param,
                 control_only_training=control_only_training,
-                **kwargs,
+                **model_kwargs,
             )
 
         self.init_params_ = self._get_init_params(locals())
+
+    def train(
+        self,
+        max_epochs=None,
+        accelerator="auto",
+        devices="auto",
+        train_size=None,
+        validation_size=None,
+        shuffle_set_split=True,
+        load_sparse_tensor=False,
+        batch_size=128,
+        early_stopping=False,
+        datasplitter_kwargs=None,
+        plan_kwargs=None,
+        datamodule=None,
+        **trainer_kwargs,
+    ):
+        """Train the model.
+        
+        Parameters are the same as UnsupervisedTrainingMixin.train(), but we override
+        to pass control_only_training to the data splitter.
+        """
+        if datamodule is None:
+            datasplitter_kwargs = datasplitter_kwargs or {}
+            # Pass control_only_training to the custom data splitter
+            datasplitter_kwargs["control_only_training"] = self.control_only_training
+        
+        # Call parent train method
+        return super().train(
+            max_epochs=max_epochs,
+            accelerator=accelerator,
+            devices=devices,
+            train_size=train_size,
+            validation_size=validation_size,
+            shuffle_set_split=shuffle_set_split,
+            load_sparse_tensor=load_sparse_tensor,
+            batch_size=batch_size,
+            early_stopping=early_stopping,
+            datasplitter_kwargs=datasplitter_kwargs,
+            plan_kwargs=plan_kwargs,
+            datamodule=datamodule,
+            **trainer_kwargs,
+        )
 
     def _make_data_loader(
         self,
@@ -204,22 +316,21 @@ class PHVI(
         indices=None,
         batch_size=None,
         shuffle=False,
+        for_training=False,
         **data_loader_kwargs,
     ):
         """Override to filter training data to controls only when enabled."""
-        # The fix is to check for `shuffle=True`, which is the default for the training dataloader.
-        if self.control_only_training and shuffle:
-            if "is_training_well" in self.adata_manager.adata.obs.columns:
-                # Use the full adata registered with the manager to find all possible controls
-                control_indices = np.where(self.adata_manager.adata.obs["is_training_well"])[0]
+        if self.control_only_training and for_training and indices is None and adata is not None:
+            # Filter to training wells (controls) during training ONLY
+            if "is_training_well" in adata.obs.columns:
+                control_indices = np.where(adata.obs["is_training_well"])[0]
                 logger.info(f"Using {len(control_indices)} control wells for training")
                 return super()._make_data_loader(
-                    self.adata_manager.adata, control_indices, batch_size, shuffle, **data_loader_kwargs
+                    adata, control_indices, batch_size, shuffle, **data_loader_kwargs
                 )
             else:
                 logger.warning("is_training_well column not found. Using all wells for training.")
         
-        # For all other cases (inference), use the data as provided.
         return super()._make_data_loader(
             adata, indices, batch_size, shuffle, **data_loader_kwargs
         )
