@@ -447,6 +447,7 @@ class PHVI(
 
         return anchored_latent
 
+    # NEW AND IMPROVED setup_anndata METHOD
     @classmethod
     @setup_anndata_dsp.dedent
     def setup_anndata(
@@ -458,10 +459,11 @@ class PHVI(
         condition_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
+        hierarchical_batch_keys: list[str] | None = None, # NEW PARAMETER
         **kwargs,
     ):
         """%(summary)s.
-
+    
         Parameters
         ----------
         %(param_adata)s
@@ -472,10 +474,33 @@ class PHVI(
             Key in `adata.obs` for condition information used in conditional VAE.
         %(param_cat_cov_keys)s
         %(param_cont_cov_keys)s
+        hierarchical_batch_keys
+            A list of two keys in `adata.obs` to be combined to create a hierarchical
+            batch key. If provided, this will override the `batch_key` argument.
+            Example: `['experiment', 'plate_number']`.
         """
+        if hierarchical_batch_keys is not None:
+            if len(hierarchical_batch_keys) != 2:
+                raise ValueError("`hierarchical_batch_keys` must be a list of exactly two keys.")
+            key1, key2 = hierarchical_batch_keys
+            if key1 not in adata.obs.columns or key2 not in adata.obs.columns:
+                raise ValueError(f"One or both keys '{key1}', '{key2}' not found in adata.obs.")
+            
+            # Create the new hierarchical batch column
+            new_batch_col_name = f"{key1}_{key2}"
+            logger.info(
+                f"Creating hierarchical batch key '{new_batch_col_name}' from '{key1}' and '{key2}'."
+            )
+            adata.obs[new_batch_col_name] = (
+                adata.obs[key1].astype(str) + "_" + adata.obs[key2].astype(str)
+            )
+            
+            # Override the batch_key to use the new column
+            batch_key = new_batch_col_name
+            logger.info(f"Using '{batch_key}' as the final batch key.")
+            
         setup_method_args = cls._get_setup_method_args(**locals())
-
-        # Note: is_count_data=False for continuous phenomics features
+    
         anndata_fields = [
             LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=False),
             CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key),
@@ -484,10 +509,9 @@ class PHVI(
             NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),
         ]
         
-        # Add condition field if specified
         if condition_key is not None:
             anndata_fields.append(CategoricalObsField("condition", condition_key))
-
+    
         adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
