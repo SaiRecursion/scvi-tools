@@ -75,20 +75,24 @@ def read_phenomics(
     obs = df[metadata_cols].copy()
 
     # Create perturbation summary if requested
-    if create_perturbation_summary and all(col in obs.columns for col in ["map_perturbation_type", "map_gene", "map_concentration"]):
+    if create_perturbation_summary and "map_perturbation_type" in obs.columns:
         def create_summary(row):
             pert_type = str(row["map_perturbation_type"]).lower()
             if pert_type == "gene":
-                return row['map_gene']
+                return row['map_gene'] if 'map_gene' in obs.columns else 'GENE_UNKNOWN'
             elif pert_type == "compound":
-                return f"{row['map_rec_id']}_{row['map_concentration']}"
+                # Handle compounds with rec_id and concentration for specificity
+                rec_id = row.get('map_rec_id', 'UNKNOWN_COMPOUND')
+                concentration = row.get('map_concentration', 'UNKNOWN_CONC')
+                return f"{rec_id}_{concentration}"
             elif pert_type == "empty":
                 return "CONTROL_EMPTY"
             else:
                 return "unknown"
 
         obs["perturbation_summary"] = obs.apply(create_summary, axis=1)
-        logger.info("Created perturbation_summary column")
+        n_unique_perturbations = obs["perturbation_summary"].nunique()
+        logger.info(f"Created perturbation_summary column with {n_unique_perturbations} unique perturbations")
 
     # Mark control wells for training if control_only_training is enabled
     if control_only_training:

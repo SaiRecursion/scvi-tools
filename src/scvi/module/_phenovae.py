@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch.distributions import Normal
+from torch import nn
 
 from scvi import REGISTRY_KEYS
 from scvi.module._constants import MODULE_KEYS
@@ -19,6 +20,56 @@ if TYPE_CHECKING:
     from torch.distributions import Distribution
 
 logger = logging.getLogger(__name__)
+
+
+class ResidualFCLayers(nn.Module):
+    """Custom FCLayers with residual connections."""
+    def __init__(
+        self,
+        n_in: int,
+        n_out: int,
+        n_cat_list: list[int] | None = None,
+        n_layers: int = 1,
+        n_hidden: int = 128,
+        dropout_rate: float = 0.1,
+        inject_covariates: bool = True,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = False,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            in_dim = n_in if i == 0 else n_hidden
+            out_dim = n_hidden if i < n_layers - 1 else n_out
+            layer = nn.Linear(in_dim, out_dim)
+            self.layers.append(layer)
+            if use_batch_norm:
+                self.layers.append(nn.BatchNorm1d(out_dim))
+            if use_layer_norm:
+                self.layers.append(nn.LayerNorm(out_dim))
+            if dropout_rate > 0 and i < n_layers - 1:
+                self.layers.append(nn.Dropout(dropout_rate))
+            self.layers.append(nn.ReLU())
+            if in_dim == out_dim and i < n_layers - 1:
+                self.layers.append(nn.Identity())
+        self.inject_covariates = inject_covariates
+        self.n_cat_list = n_cat_list or []
+
+    def forward(self, x: torch.Tensor, *cat_list: torch.Tensor):
+        h = x
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, nn.Linear):
+                h_prev = h
+                h = layer(h)
+                if h_prev.shape == h.shape:
+                    h = h + h_prev
+            else:
+                h = layer(h)
+            if self.inject_covariates and cat_list and i < len(self.n_cat_list):
+                cat = cat_list[i]
+                if cat is not None:
+                    h = h + torch.nn.functional.one_hot(cat.long(), self.n_cat_list[i]).float()
+        return h
 
 
 class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
@@ -60,13 +111,13 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         Callable used to ensure positivity of the variance of the variational distribution.
     output_var_param
         How to parameterize the output variance. One of:
-        
         * ``"learned"``: learn a single variance parameter per feature
         * ``"fixed"``: use a fixed variance of 1.0
         * ``"feature"``: learn separate variance for each feature
-        * ``"conditional"``: learn variance conditioned on perturbation
     control_only_training
         If ``True``, the model is only used for control and not for training.
+    use_corr_loss
+        If ``True``, adds adversarial correlation loss for batch disentanglement.
     """
 
     def __init__(
@@ -74,26 +125,27 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         n_input: int,
         n_batch: int = 0,
         n_hidden: int = 128,
-        n_latent: int = 10,
+        n_latent: int = 128,
         n_layers: int = 1,
         n_continuous_cov: int = 0,
         n_cats_per_cov: list[int] | None = None,
         n_conditions: int = 0,
         dropout_rate: float = 0.1,
         encode_covariates: bool = False,
-        deeply_inject_covariates: bool = True,
+        deeply_inject_covariates: bool = False,
         batch_representation: Literal["one-hot", "embedding"] = "one-hot",
         condition_representation: Literal["one-hot", "embedding"] = "embedding",
         use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         var_activation: Callable[[torch.Tensor], torch.Tensor] = None,
-        output_var_param: Literal["learned", "fixed", "feature", "conditional"] = "learned",
+        output_var_param: Literal["learned", "fixed", "feature"] = "feature",
+        var_reg_lambda: float = 0.01,
+        recon_beta: float = 1.0,
         batch_embedding_kwargs: dict | None = None,
         condition_embedding_kwargs: dict | None = None,
         control_only_training: bool = False,
+        use_corr_loss: bool = False,
     ):
-        from scvi.nn import Encoder
-
         super().__init__()
 
         self.n_latent = n_latent
@@ -102,29 +154,29 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         self.n_conditions = n_conditions
         self.encode_covariates = encode_covariates
         self.output_var_param = output_var_param
+        self.var_reg_lambda = var_reg_lambda
+        self.recon_beta = recon_beta
         self.is_cvae = n_conditions > 0
         self.control_only_training = control_only_training
+        self.use_corr_loss = use_corr_loss
 
         # Initialize output variance parameters
         if self.output_var_param == "learned":
-            # Single learnable log variance
-            self.px_log_var = torch.nn.Parameter(torch.zeros(1))
+            self.px_log_var = torch.nn.Parameter(torch.full((1,), -2.3))
         elif self.output_var_param == "feature":
-            # Per-feature learnable log variance
-            self.px_log_var = torch.nn.Parameter(torch.zeros(n_input))
-        elif self.output_var_param == "conditional" and self.is_cvae:
-            # Will be handled by conditional variance decoder
+            self.px_log_var = torch.nn.Parameter(torch.zeros((n_input,)))
+        elif self.output_var_param == "fixed":
             self.px_log_var = None
-        # For "fixed", we don't need parameters
+        else:
+            raise ValueError("output_var_param must be 'learned', 'fixed', or 'feature'")
 
         self.batch_representation = batch_representation
         if self.batch_representation == "embedding":
             self.init_embedding(REGISTRY_KEYS.BATCH_KEY, n_batch, **(batch_embedding_kwargs or {}))
             batch_dim = self.get_embedding(REGISTRY_KEYS.BATCH_KEY).embedding_dim
-        elif self.batch_representation != "one-hot":
-            raise ValueError("`batch_representation` must be one of 'one-hot', 'embedding'.")
+        else:
+            batch_dim = n_batch
 
-        # Handle condition representation for CVAE
         self.condition_representation = condition_representation
         condition_dim = 0
         if self.is_cvae:
@@ -134,61 +186,50 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
             else:
                 condition_dim = n_conditions
 
-        use_batch_norm_encoder = use_batch_norm == "encoder" or use_batch_norm == "both"
-        use_batch_norm_decoder = use_batch_norm == "decoder" or use_batch_norm == "both"
-        use_layer_norm_encoder = use_layer_norm == "encoder" or use_layer_norm == "both"
-        use_layer_norm_decoder = use_layer_norm == "decoder" or use_layer_norm == "both"
+        use_batch_norm_encoder = use_batch_norm in ["encoder", "both"]
+        use_batch_norm_decoder = use_batch_norm in ["decoder", "both"]
+        use_layer_norm_encoder = use_layer_norm in ["encoder", "both"]
+        use_layer_norm_decoder = use_layer_norm in ["decoder", "both"]
 
         n_input_encoder = n_input + n_continuous_cov * encode_covariates
-        if self.batch_representation == "embedding":
-            n_input_encoder += batch_dim * encode_covariates
-            cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
-        else:
-            cat_list = [n_batch] + list([] if n_cats_per_cov is None else n_cats_per_cov)
-
-        # Add condition dimension to encoder input
-        if self.is_cvae:
+        n_input_encoder += batch_dim * encode_covariates
+        cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
+        if self.batch_representation != "embedding":
+            cat_list = [n_batch] + cat_list
+        if self.is_cvae and self.condition_representation == "one-hot":
             n_input_encoder += condition_dim
-            if self.condition_representation == "one-hot":
-                cat_list = [n_conditions] + cat_list
+            cat_list = [n_conditions] + cat_list
+        if self.is_cvae and self.condition_representation == "embedding" and self.encode_covariates:
+            n_input_encoder += condition_dim
 
         encoder_cat_list = cat_list if encode_covariates else None
 
-        # Encoder for latent representation
-        self.z_encoder = Encoder(
-            n_input_encoder,
-            n_latent,
+        self.z_encoder = ResidualFCLayers(
+            n_in=n_input_encoder,
+            n_out=n_latent * 2,
             n_cat_list=encoder_cat_list,
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=dropout_rate,
-            distribution="normal",
             inject_covariates=deeply_inject_covariates,
             use_batch_norm=use_batch_norm_encoder,
             use_layer_norm=use_layer_norm_encoder,
-            var_activation=var_activation,
-            return_dist=True,
         )
 
-        n_input_decoder = n_latent + n_continuous_cov
-        if self.batch_representation == "embedding":
-            n_input_decoder += batch_dim
-        
-        # Add condition dimension to decoder input
+        n_input_decoder = n_latent + n_continuous_cov + batch_dim
         if self.is_cvae:
             n_input_decoder += condition_dim
 
-        # Custom decoder for phenomics that outputs mean and log variance
-        self.decoder = PhenomicsDecoder(
-            n_input_decoder,
-            n_input,
+        self.decoder = ResidualFCLayers(
+            n_in=n_input_decoder,
+            n_out=n_input,
             n_cat_list=cat_list,
             n_layers=n_layers,
             n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
             inject_covariates=deeply_inject_covariates,
             use_batch_norm=use_batch_norm_decoder,
             use_layer_norm=use_layer_norm_decoder,
-            output_variance=self.output_var_param == "conditional",
         )
 
     def _get_inference_input(
@@ -232,50 +273,37 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         condition_index: torch.Tensor | None = None,
         n_samples: int = 1,
     ) -> dict[str, torch.Tensor | Distribution | None]:
-        """Run the inference process."""
-        x_ = x  # No log transformation needed for continuous features
+        """Run the inference process with batch index validation."""
+        batch_index = batch_index.long()
+        if batch_index.max() >= self.n_batch or batch_index.min() < 0:
+            raise ValueError(f"batch_index out of bounds: max={batch_index.max()}, min={batch_index.min()}, n_batch={self.n_batch}")
 
-        # Build encoder input
-        encoder_inputs = [x_]
+        encoder_inputs = [x]
         categorical_inputs = []
-
-        # Add continuous covariates
         if cont_covs is not None and self.encode_covariates:
             encoder_inputs.append(cont_covs)
-
-        # Add batch representation
         if self.batch_representation == "embedding" and self.encode_covariates:
             batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
             encoder_inputs.append(batch_rep)
         else:
             categorical_inputs.append(batch_index)
-
-        # Add condition representation for CVAE
         if self.is_cvae and condition_index is not None:
+            condition_index = condition_index.long()
             if self.condition_representation == "embedding":
                 condition_rep = self.compute_embedding("condition", condition_index)
                 encoder_inputs.append(condition_rep)
             else:
                 categorical_inputs.append(condition_index)
-
-        # Add categorical covariates
         if cat_covs is not None and self.encode_covariates:
             categorical_inputs.extend(torch.split(cat_covs, 1, dim=1))
 
-        # Concatenate encoder inputs
         encoder_input = torch.cat(encoder_inputs, dim=-1)
+        qz_params = self.z_encoder(encoder_input, *categorical_inputs)
+        qz_m, qz_v = qz_params.chunk(2, dim=-1)
+        qz = Normal(qz_m, torch.nn.functional.softplus(qz_v) + 1e-6)
+        z = qz.rsample() if n_samples == 1 else qz.rsample((n_samples,))
 
-        # Run encoder
-        qz, z = self.z_encoder(encoder_input, *categorical_inputs)
-
-        if n_samples > 1:
-            untran_z = qz.sample((n_samples,))
-            z = self.z_encoder.z_transformation(untran_z)
-
-        return {
-            MODULE_KEYS.Z_KEY: z,
-            MODULE_KEYS.QZ_KEY: qz,
-        }
+        return {MODULE_KEYS.Z_KEY: z, MODULE_KEYS.QZ_KEY: qz}
 
     @auto_move_data
     def generative(
@@ -286,58 +314,48 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         cat_covs: torch.Tensor | None = None,
         condition_index: torch.Tensor | None = None,
     ) -> dict[str, Distribution | None]:
-        """Run the generative process."""
-        # Build decoder input
+        """Run the generative process with batch index validation."""
+        batch_index = batch_index.long()
+        if batch_index.max() >= self.n_batch or batch_index.min() < 0:
+            raise ValueError(f"batch_index out of bounds: max={batch_index.max()}, min={batch_index.min()}, n_batch={self.n_batch}")
+
         decoder_inputs = [z]
         categorical_inputs = []
-
-        # Add continuous covariates
         if cont_covs is not None:
             if z.dim() != cont_covs.dim():
                 decoder_inputs.append(cont_covs.unsqueeze(0).expand(z.size(0), -1, -1))
             else:
                 decoder_inputs.append(cont_covs)
-
-        # Add batch representation
         if self.batch_representation == "embedding":
             batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
             decoder_inputs.append(batch_rep)
         else:
             categorical_inputs.append(batch_index)
-
-        # Add condition representation for CVAE
         if self.is_cvae and condition_index is not None:
+            condition_index = condition_index.long()
             if self.condition_representation == "embedding":
                 condition_rep = self.compute_embedding("condition", condition_index)
                 decoder_inputs.append(condition_rep)
             else:
                 categorical_inputs.append(condition_index)
-
-        # Add categorical covariates
         if cat_covs is not None:
             categorical_inputs.extend(torch.split(cat_covs, 1, dim=1))
 
-        # Concatenate decoder inputs
         decoder_input = torch.cat(decoder_inputs, dim=-1)
+        px_mean = self.decoder(decoder_input, *categorical_inputs)
 
-        # Run decoder
-        decoder_output = self.decoder(decoder_input, *categorical_inputs)
-        
-        if self.output_var_param == "conditional":
-            px_mean, px_log_var = decoder_output
-            px_var = torch.exp(px_log_var)
-        else:
-            px_mean = decoder_output
-            # Get variance
-            if self.output_var_param == "fixed":
-                px_var = torch.ones_like(px_mean)
-            elif self.output_var_param == "learned":
-                px_var = torch.exp(self.px_log_var) * torch.ones_like(px_mean)
-            else:  # "feature"
-                px_var = torch.exp(self.px_log_var).unsqueeze(0).expand_as(px_mean)
+        if self.output_var_param == "fixed":
+            px_var = torch.ones_like(px_mean)
+        elif self.output_var_param == "learned":
+            log_var_clamped = torch.clamp(self.px_log_var, min=-10, max=2)
+            px_var = torch.exp(log_var_clamped) * torch.ones_like(px_mean)
+        else:  # "feature"
+            log_var_clamped = torch.clamp(self.px_log_var, min=-10, max=2)
+            px_var = torch.exp(log_var_clamped).unsqueeze(0).expand_as(px_mean)
 
-        # Create Gaussian distribution
-        px = Normal(px_mean, torch.sqrt(px_var))
+        px_var = torch.clamp(px_var, min=1e-6, max=100.0)
+        px_std = torch.sqrt(px_var)
+        px = Normal(px_mean, px_std)
 
         return {MODULE_KEYS.PX_KEY: px}
 
@@ -347,28 +365,63 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         inference_outputs: dict[str, torch.Tensor | Distribution | None],
         generative_outputs: dict[str, Distribution | None],
         kl_weight: float = 1.0,
+        **kwargs,
     ) -> LossOutput:
-        """Compute the loss."""
+        """Compute the loss for phenomics VAE with KL annealing and correlation loss."""
+        if kwargs and not hasattr(self, '_logged_kwargs'):
+            print(f"DEBUG: Loss function received additional kwargs: {list(kwargs.keys())}")
+            self._logged_kwargs = True
+
         x = tensors[REGISTRY_KEYS.X_KEY]
         px = generative_outputs[MODULE_KEYS.PX_KEY]
         qz = inference_outputs[MODULE_KEYS.QZ_KEY]
 
-        # Reconstruction loss - negative log likelihood
-        reconst_loss = -px.log_prob(x).sum(-1)
+        log_likelihood = px.log_prob(x).sum(-1)
+        reconst_loss = -log_likelihood
+        var_reg = self.var_reg_lambda * torch.mean(px.scale)
+        reconst_loss = self.recon_beta * reconst_loss + var_reg
 
-        # KL divergence
         kl_divergence_z = torch.distributions.kl_divergence(
             qz, Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale))
         ).sum(dim=1)
 
-        # Weighted ELBO
-        weighted_kl = kl_weight * kl_divergence_z
-        loss = torch.mean(reconst_loss + weighted_kl)
+        kl_anneal_epochs = kwargs.get('kl_anneal_epochs', 0)
+        current_epoch = getattr(self, '_current_epoch', 0)
+        effective_kl_weight = min(1.0, current_epoch / kl_anneal_epochs) if kl_anneal_epochs > 0 else kl_weight
 
+        # Ensure tensors are proper shape for LossOutput
+        mean_reconst_loss = torch.mean(reconst_loss)
+        mean_kl_loss = torch.mean(kl_divergence_z)
+        
+        corr_loss = torch.tensor(0.0, device=x.device)
+        if hasattr(self, 'use_corr_loss') and self.use_corr_loss:
+            batch_id = tensors.get(REGISTRY_KEYS.BATCH_KEY, torch.zeros_like(x[:, 0])).float()
+            z = inference_outputs[MODULE_KEYS.Z_KEY]
+            
+            # Handle both 2D and 3D z tensors
+            if z.dim() == 3:  # Shape: [n_samples, batch_size, n_latent]
+                n_samples = z.size(0)
+                # Expand batch_id to match n_samples dimension, then add feature dimension
+                batch_id = batch_id.unsqueeze(0).expand(n_samples, -1).unsqueeze(-1)  # Shape: [n_samples, batch_size, 1]
+                z = z.view(-1, z.size(-1))  # Flatten to [n_samples * batch_size, n_latent]
+                batch_id = batch_id.view(-1, 1)  # Flatten to [n_samples * batch_size, 1]
+            else:  # Shape: [batch_size, n_latent]
+                # batch_id is already [batch_size], just need to add feature dimension
+                if batch_id.dim() == 1:
+                    batch_id = batch_id.unsqueeze(-1)  # Shape: [batch_size, 1]
+                # If batch_id is already [batch_size, 1], keep it as is
+            
+            corr_matrix = torch.corrcoef(torch.cat([z, batch_id], dim=-1).T)
+            corr_loss = torch.abs(corr_matrix[:-1, -1]).mean() * 0.01
+
+        total_loss = mean_reconst_loss + effective_kl_weight * mean_kl_loss + corr_loss
+
+        # Use the same format as the standard VAE implementation
         return LossOutput(
-            loss=loss,
-            reconstruction_loss=reconst_loss,
-            kl_local={MODULE_KEYS.KL_Z_KEY: kl_divergence_z},
+            loss=total_loss,
+            reconstruction_loss=reconst_loss,  # Pass the full tensor, not the mean
+            kl_local={MODULE_KEYS.KL_Z_KEY: kl_divergence_z},  # Pass the full tensor, not the mean
+            extra_metrics={"corr_loss": corr_loss}
         )
 
     @torch.inference_mode()
@@ -380,60 +433,5 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         """Sample from the generative model."""
         inference_outputs = self.inference(**self._get_inference_input(tensors), n_samples=n_samples)
         generative_outputs = self.generative(**self._get_generative_input(tensors, inference_outputs))
-
         px = generative_outputs[MODULE_KEYS.PX_KEY]
         return px.sample()
-
-
-class PhenomicsDecoder(torch.nn.Module):
-    """Decoder for phenomics data that outputs continuous values."""
-
-    def __init__(
-        self,
-        n_input: int,
-        n_output: int,
-        n_cat_list: list[int] | None = None,
-        n_layers: int = 1,
-        n_hidden: int = 128,
-        inject_covariates: bool = True,
-        use_batch_norm: bool = False,
-        use_layer_norm: bool = False,
-        output_variance: bool = False,
-    ):
-        from scvi.nn import FCLayers
-
-        super().__init__()
-        self.output_variance = output_variance
-        
-        self.decoder = FCLayers(
-            n_in=n_input,
-            n_out=n_hidden,
-            n_cat_list=n_cat_list,
-            n_layers=n_layers,
-            n_hidden=n_hidden,
-            dropout_rate=0,
-            inject_covariates=inject_covariates,
-            use_batch_norm=use_batch_norm,
-            use_layer_norm=use_layer_norm,
-        )
-
-        # Linear layer for mean output
-        self.mean_decoder = torch.nn.Linear(n_hidden, n_output)
-        
-        # Optional variance decoder for conditional variance
-        if self.output_variance:
-            self.var_decoder = torch.nn.Linear(n_hidden, n_output)
-
-    def forward(self, x: torch.Tensor, *cat_list: torch.Tensor):
-        """Forward pass."""
-        # Get hidden representation
-        h = self.decoder(x, *cat_list)
-        # Output mean
-        px_mean = self.mean_decoder(h)
-        
-        if self.output_variance:
-            # Output log variance
-            px_log_var = self.var_decoder(h)
-            return px_mean, px_log_var
-        else:
-            return px_mean

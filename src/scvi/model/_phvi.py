@@ -35,34 +35,39 @@ logger = logging.getLogger(__name__)
 class PHVIDataSplitter(DataSplitter):
     """
     Custom DataSplitter for PHVI that respects control_only_training.
-    This version correctly handles empty validation sets.
+    This version correctly handles empty validation sets when control_only_training is True,
+    and defaults to standard behavior when it's False.
     """
 
     def __init__(self, adata_manager, **kwargs):
         # Pop our custom argument before passing to the parent __init__.
-        # This is a cleaner pattern than re-implementing the whole __init__.
         self.control_only_training = kwargs.pop("control_only_training", False)
         super().__init__(adata_manager, **kwargs)
 
     def setup(self, stage=None):
         """
         Split indices in train/test/val sets.
-        If control_only_training, the train set is ONLY the control wells.
-        The val and test sets are split from the remaining non-control wells.
+        If control_only_training is True, the train set is ONLY the control wells.
+        The val and test sets are empty.
+        If control_only_training is False, it uses the parent's default behavior.
         """
-        # First, let the parent class perform its default index splitting.
+        # Let the parent class perform its default index splitting first.
+        # This will correctly handle train_size/validation_size for the False case.
         super().setup(stage)
 
-        # Now, if control_only_training is enabled, we override the splits.
+        # Now, IF AND ONLY IF control_only_training is enabled, we override the splits.
         if self.control_only_training:
             adata = self.adata_manager.adata
             if "is_training_well" not in adata.obs.columns:
                 logger.warning(
                     "'is_training_well' column not found. Disabling control_only_training logic."
                 )
+                # Fallback to standard behavior if the column is missing
+                self.control_only_training = False 
                 return
 
             all_indices = np.arange(adata.n_obs)
+            # Use the 'is_training_well' column created in the notebook
             control_indices = all_indices[adata.obs["is_training_well"].to_numpy(dtype=bool)]
             
             if len(control_indices) == 0:
@@ -72,24 +77,24 @@ class PHVIDataSplitter(DataSplitter):
             self.train_idx = control_indices
             logger.info(f"PHVI: Overriding training data with {len(self.train_idx)} control wells.")
 
-            # IMPORTANT: Since all wells in the training anndata are controls, the non-control
-            # set is empty. Therefore, the validation and test sets must also be empty.
+            # The validation and test sets MUST be empty for this mode to avoid errors.
             self.val_idx = np.array([], dtype=int)
             self.test_idx = np.array([], dtype=int)
             logger.info("PHVI: Setting validation and test sets to empty for control-only training.")
 
     def val_dataloader(self):
         """
-        Override to prevent crashing when the validation set is empty.
+        Override to prevent crashing when the validation set is empty, which is the case
+        when control_only_training is True.
         """
-        # THE CRITICAL FIX: If val_idx is empty, return a valid, empty dataloader.
+        # If the validation index array is empty, return a valid, empty dataloader.
         if len(self.val_idx) == 0:
             return self.data_loader_cls(
                 self.adata_manager,
                 indices=self.val_idx, # Pass the empty array
                 batch_size=self.data_loader_kwargs.get("batch_size", 128)
             )
-        # Otherwise, let the parent handle it.
+        # Otherwise (when control_only_training=False), let the parent handle it.
         return super().val_dataloader()
 
 
@@ -132,13 +137,14 @@ class PHVI(
         * ``"embedding"`` - Embedding representation for condition.
         * ``"one-hot"`` - One-hot representation for condition.
     use_batch_norm
-        Whether to use batch normalization in layers.
+        Whether to use batch normalization in layers. One of "encoder", "decoder", "none", "both".
     use_layer_norm
-        Whether to use layer normalization in layers.
+        Whether to use layer normalization in layers. One of "encoder", "decoder", "none", "both".
     output_var_param
         Output variance parameter for the decoder.
     control_only_training
         If True, train only on control wells while using all wells for inference.
+        This requires an `is_training_well` column in `adata.obs`.
     **model_kwargs
         Keyword args for :class:`~scvi.module.PhenoVAE`
 
@@ -158,24 +164,27 @@ class PHVI(
         self,
         adata: AnnData,
         n_hidden: int = 128,
-        n_latent: int = 10,
+        n_latent: int = 128,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
-        encode_covariates: bool = True,
-        deeply_inject_covariates: bool = True,
+        encode_covariates: bool = False,
+        deeply_inject_covariates: bool = False,
         batch_representation: Literal["embedding", "one-hot"] = "one-hot",
         condition_representation: Literal["embedding", "one-hot"] = "one-hot",
-        use_batch_norm: bool = True,
-        use_layer_norm: bool = False,
-        output_var_param: Literal["learned", "fixed", "feature", "conditional"] = "learned",
-        control_only_training: bool = False,
+        use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
+        use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
+        output_var_param: Literal["learned", "fixed", "feature", "conditional"] = "conditional",
+        var_reg_lambda: float = 0.001,
+        recon_beta: float = 1.0,
+        control_only_training: bool = True,
         **model_kwargs,
     ):
         super().__init__(adata)
 
-        # Store control_only_training for use in data splitting
+        # Store control_only_training for use in data splitting and module init
         self.control_only_training = control_only_training
 
+        # Pass all relevant parameters to the underlying module
         self._module_kwargs = {
             "n_hidden": n_hidden,
             "n_latent": n_latent,
@@ -186,8 +195,11 @@ class PHVI(
             "batch_representation": batch_representation,
             "condition_representation": condition_representation,
             "use_batch_norm": use_batch_norm,
-            "use_layer_norm": use_layer_norm,
+            "use_layer_norm": use_layer_norm, # Make sure this is passed
             "output_var_param": output_var_param,
+            "var_reg_lambda": var_reg_lambda,
+            "recon_beta": recon_beta,
+            "control_only_training": control_only_training,
             **model_kwargs,
         }
         self._model_summary_string = (
@@ -195,6 +207,7 @@ class PHVI(
             f"n_hidden: {n_hidden}, n_latent: {n_latent}, n_layers: {n_layers}, "
             f"dropout_rate: {dropout_rate}, output_var_param: {output_var_param}, "
             f"batch_representation: {batch_representation}, "
+            f"use_layer_norm: {use_layer_norm}, " # Add to summary for clarity
             f"control_only_training: {control_only_training}."
         )
 
@@ -208,23 +221,20 @@ class PHVI(
             )
         else:
             if adata is not None:
-                n_cats_per_cov = (
-                    self.adata_manager.get_state_registry(
-                        REGISTRY_KEYS.CAT_COVS_KEY
-                    ).n_cats_per_key
-                    if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
-                    else None
-                )
-                # Get number of conditions if available
-                n_conditions = (
-                    self.adata_manager.get_state_registry(
-                        "condition"
-                    ).n_cats
-                    if "condition" in self.adata_manager.data_registry
-                    else 0
-                )
+                if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry:
+                    cat_cov_registry = self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY)
+                    n_cats_per_cov = cat_cov_registry.get("n_cats_per_key", None)
+                else:
+                    n_cats_per_cov = None
+                if "condition" in self.adata_manager.data_registry:
+                    condition_registry = self.adata_manager.get_state_registry("condition")
+                    # Debug: print available keys
+                    print("Condition registry keys:", list(condition_registry.keys()))
+                    n_conditions = len(condition_registry.get("categorical_mapping", []))
+                    print(f"Number of conditions found: {n_conditions}")
+                else:
+                    n_conditions = 0
             else:
-                # custom datamodule
                 if (
                     len(
                         self.registry["field_registries"][f"{REGISTRY_KEYS.CAT_COVS_KEY}"][
@@ -250,19 +260,7 @@ class PHVI(
                 n_continuous_cov=self.summary_stats.get("n_extra_continuous_covs", 0),
                 n_cats_per_cov=n_cats_per_cov,
                 n_conditions=n_conditions,
-                n_hidden=n_hidden,
-                n_latent=n_latent,
-                n_layers=n_layers,
-                dropout_rate=dropout_rate,
-                encode_covariates=encode_covariates,
-                deeply_inject_covariates=deeply_inject_covariates,
-                batch_representation=batch_representation,
-                condition_representation=condition_representation,
-                use_batch_norm=use_batch_norm,
-                use_layer_norm=use_layer_norm,
-                output_var_param=output_var_param,
-                control_only_training=control_only_training,
-                **model_kwargs,
+                **self._module_kwargs,
             )
 
         self.init_params_ = self._get_init_params(locals())
@@ -272,7 +270,7 @@ class PHVI(
         max_epochs=None,
         accelerator="auto",
         devices="auto",
-        train_size=None,
+        train_size=0.9,
         validation_size=None,
         shuffle_set_split=True,
         load_sparse_tensor=False,
@@ -288,12 +286,25 @@ class PHVI(
         Parameters are the same as UnsupervisedTrainingMixin.train(), but we override
         to pass control_only_training to the data splitter.
         """
+        # Debug: Print what we're receiving
+        print(f"DEBUG: plan_kwargs = {plan_kwargs}")
+        print(f"DEBUG: trainer_kwargs keys = {list(trainer_kwargs.keys()) if trainer_kwargs else 'None'}")
+        
+        # Filter out any optimizer-related params that might have leaked into trainer_kwargs
+        if trainer_kwargs:
+            optimizer_params = ['lr', 'weight_decay', 'kl_weight', 'kl_anneal_epochs']
+            filtered_trainer_kwargs = {k: v for k, v in trainer_kwargs.items() 
+                                     if k not in optimizer_params}
+            print(f"DEBUG: filtered_trainer_kwargs keys = {list(filtered_trainer_kwargs.keys())}")
+        else:
+            filtered_trainer_kwargs = {}
+        
         if datamodule is None:
             datasplitter_kwargs = datasplitter_kwargs or {}
-            # Pass control_only_training to the custom data splitter
+            # Pass control_only_training to our custom data splitter
             datasplitter_kwargs["control_only_training"] = self.control_only_training
         
-        # Call parent train method
+        # Call parent train method with the updated kwargs
         return super().train(
             max_epochs=max_epochs,
             accelerator=accelerator,
@@ -307,32 +318,7 @@ class PHVI(
             datasplitter_kwargs=datasplitter_kwargs,
             plan_kwargs=plan_kwargs,
             datamodule=datamodule,
-            **trainer_kwargs,
-        )
-
-    def _make_data_loader(
-        self,
-        adata=None,
-        indices=None,
-        batch_size=None,
-        shuffle=False,
-        for_training=False,
-        **data_loader_kwargs,
-    ):
-        """Override to filter training data to controls only when enabled."""
-        if self.control_only_training and for_training and indices is None and adata is not None:
-            # Filter to training wells (controls) during training ONLY
-            if "is_training_well" in adata.obs.columns:
-                control_indices = np.where(adata.obs["is_training_well"])[0]
-                logger.info(f"Using {len(control_indices)} control wells for training")
-                return super()._make_data_loader(
-                    adata, control_indices, batch_size, shuffle, **data_loader_kwargs
-                )
-            else:
-                logger.warning("is_training_well column not found. Using all wells for training.")
-        
-        return super()._make_data_loader(
-            adata, indices, batch_size, shuffle, **data_loader_kwargs
+            **filtered_trainer_kwargs,
         )
 
     def get_normalized_expression(
@@ -342,32 +328,13 @@ class PHVI(
         n_samples: int = 1,
         batch_size: int | None = None,
     ) -> np.ndarray:
-        """Get the denoised phenomics features.
-
-        Parameters
-        ----------
-        adata
-            AnnData object to use. If None, uses the registered AnnData.
-        indices
-            Indices of cells to use.
-        n_samples
-            Number of samples to use for posterior averaging.
-        batch_size
-            Batch size to use for computation.
-
-        Returns
-        -------
-        Denoised phenomics features of shape (n_obs, n_features).
-        """
+        """Get the denoised phenomics features."""
         import numpy as np
-
         adata = self._validate_anndata(adata)
-
+        dl_kwargs = {}
         data_loader = self._make_data_loader(
-            adata=adata, indices=indices, batch_size=batch_size
+            adata=adata, indices=indices, batch_size=batch_size, **dl_kwargs
         )
-
-        # Get posterior samples and average
         denoised = []
         for tensors in data_loader:
             inference_outputs = self.module.inference(**self.module._get_inference_input(tensors))
@@ -375,9 +342,7 @@ class PHVI(
                 **self.module._get_generative_input(tensors, inference_outputs)
             )
             px = generative_outputs["px"]
-            # Use mean of the distribution for denoised expression
             denoised.append(px.loc.detach().cpu().numpy())
-
         return np.concatenate(denoised, axis=0)
 
     def get_control_anchored_latent_representation(
@@ -388,66 +353,29 @@ class PHVI(
         control_value: bool = True,
         batch_size: int | None = None,
     ) -> np.ndarray:
-        """Get control-anchored latent representation.
-
-        This method computes the latent representation and then centers it
-        by subtracting the mean of the control samples, making the origin
-        represent the average control phenotype.
-
-        Parameters
-        ----------
-        adata
-            AnnData object to use. If None, uses the registered AnnData.
-        indices
-            Indices of cells to use.
-        control_key
-            Key in adata.obs that identifies control samples.
-        control_value
-            Value that identifies control samples.
-        batch_size
-            Batch size to use for computation.
-
-        Returns
-        -------
-        Control-anchored latent representation of shape (n_obs, n_latent).
-        """
+        """Get control-anchored latent representation."""
         import numpy as np
-
         adata = self._validate_anndata(adata)
-
-        # Get standard latent representation
         latent = self.get_latent_representation(
             adata=adata, indices=indices, batch_size=batch_size
         )
-
-        # Find control samples
         if control_key not in adata.obs:
             logger.warning(f"Control key '{control_key}' not found in adata.obs. "
                           "Returning standard latent representation.")
             return latent
-
-        # Get control mask
         if indices is not None:
             obs_subset = adata.obs.iloc[indices]
         else:
             obs_subset = adata.obs
-        
         control_mask = obs_subset[control_key] == control_value
-        
         if not control_mask.any():
             logger.warning(f"No control samples found with {control_key}={control_value}. "
                           "Returning standard latent representation.")
             return latent
-
-        # Compute control centroid
         control_centroid = np.mean(latent[control_mask], axis=0, keepdims=True)
-
-        # Center latent space by control centroid
         anchored_latent = latent - control_centroid
-
         return anchored_latent
 
-    # NEW AND IMPROVED setup_anndata METHOD
     @classmethod
     @setup_anndata_dsp.dedent
     def setup_anndata(
@@ -459,7 +387,7 @@ class PHVI(
         condition_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
-        hierarchical_batch_keys: list[str] | None = None, # NEW PARAMETER
+        hierarchical_batch_keys: list[str] | None = None,
         **kwargs,
     ):
         """%(summary)s.
@@ -486,7 +414,6 @@ class PHVI(
             if key1 not in adata.obs.columns or key2 not in adata.obs.columns:
                 raise ValueError(f"One or both keys '{key1}', '{key2}' not found in adata.obs.")
             
-            # Create the new hierarchical batch column
             new_batch_col_name = f"{key1}_{key2}"
             logger.info(
                 f"Creating hierarchical batch key '{new_batch_col_name}' from '{key1}' and '{key2}'."
@@ -494,8 +421,6 @@ class PHVI(
             adata.obs[new_batch_col_name] = (
                 adata.obs[key1].astype(str) + "_" + adata.obs[key2].astype(str)
             )
-            
-            # Override the batch_key to use the new column
             batch_key = new_batch_col_name
             logger.info(f"Using '{batch_key}' as the final batch key.")
             
