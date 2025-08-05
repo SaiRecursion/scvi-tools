@@ -412,7 +412,7 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
                 # If batch_id is already [batch_size, 1], keep it as is
             
             corr_matrix = torch.corrcoef(torch.cat([z, batch_id], dim=-1).T)
-            corr_loss = torch.abs(corr_matrix[:-1, -1]).mean() * 0.01
+            corr_loss = torch.abs(corr_matrix[:-1, -1]).mean() * 0.005
 
         total_loss = mean_reconst_loss + effective_kl_weight * mean_kl_loss + corr_loss
 
