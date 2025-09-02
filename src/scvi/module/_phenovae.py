@@ -1,309 +1,414 @@
-"""Phenomics VAE module with Gaussian likelihood for continuous features."""
+"""Phenomics VAE module with Gaussian likelihood for continuous features.
+
+UNDERSTAND
+----------
+We are aligning high-dimensional phenomics embeddings (Phenom2) across ~3k
+batch combinations (experiment × plate). Our two metrics are:
+- **KNN batch predictability** (lower is better; chance ≈ 0.033%).
+- **BMDB biological recapitulation** (higher is better).
+
+TVN (linear: PCA → center/scale → CORAL) already drops KNN to ~0.8% and lifts
+BMDB to ~38%. Residual **non-linear** batch effects persist (LISI/UMAP).
+This VAE aims to scrub those *residual* effects while preserving biological
+signal on the raw data.
+
+ANALYZE / DESIGN CHOICES
+------------------------
+1) **Batch to DECODER; encoder is batch-free**:
+   - If the decoder does not see batch, the latent `z` must carry it just to
+     reconstruct `x`, which raises KNN. We therefore **feed batch to the
+     decoder** and keep the **encoder batch-free**.
+
+2) **No BatchNorm (BN)**; optional **LayerNorm** in encoder:
+   - BN depends on mini-batch composition and can leak/entangle batch effects.
+     We avoid BN entirely in this module. LayerNorm in the encoder helps
+     stabilize optimization on heterogeneous phenomics features.
+
+3) **Diagonal Gaussian likelihood**:
+   - Phenomics features are continuous. We use a diagonal Gaussian
+
+4) **Loss: reconstruction + KL (with annealing via plan)**
+   - Keep β=1.0 and rely on a training-plan KL schedule (scvi handles `kl_weight`).
+   - Remove unstable/contradictory extras (no adversarial/corr/bio-contrastive).
+
+5) **Capacity defaults**:
+   - `n_latent=128`, `n_hidden=256`, `n_layers=2`, `dropout=0.1`.
+   - Increase latent only if BMDB plateaus and KNN remains acceptably low.
+
+REASON / HOW THIS MAPS TO CODE
+------------------------------
+- Encoder is a simple residual MLP; no batch input, no BN (optional LayerNorm).
+- Decoder is a residual MLP that **concatenates** (z, batch_rep, optional cont covs).
+- Batch representation can be:
+    * "embedding": learned embedding per batch (stable, compact), or
+    * "one-hot": one-hot vector concatenated (simple/robust).
+- The module exposes `inference`/`generative` consistent with scvi-tools,
+  returning distributions and respecting shapes (including `n_samples`).
+
+SYNTHESIZE / EXPECTED EFFECT
+----------------------------
+- **↓ KNN**: because z no longer needs to encode batch to reconstruct—decoder
+  explains batch nuisances directly.
+- **↑ BMDB**: diagonal Gaussian + stable encoder preserves weak biological
+  signals; no over-compression from an overly aggressive KL (use annealing).
+
+CONCLUDE
+--------
+Use this module together with:
+- `_phenomics.read_phenomics` (loads features, vectorizes perturbation summary)
+- `PHVI.setup_anndata(..., hierarchical_batch_keys=["experiment","plate_number"])`
+to ensure the model "sees" the same nuisance granularity your KNN evaluator uses.
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Dict, Union
 
 import torch
-from torch.distributions import Normal
 from torch import nn
+import torch.nn.functional as F
+from torch.distributions import Normal, Distribution
+from torch.autograd import Function
 
 from scvi import REGISTRY_KEYS
 from scvi.module._constants import MODULE_KEYS
-from scvi.module.base import BaseModuleClass, EmbeddingModuleMixin, LossOutput, auto_move_data
+from scvi.module.base import (
+    BaseModuleClass,
+    EmbeddingModuleMixin,
+    LossOutput,
+    auto_move_data,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from typing import Literal
-
-    from torch.distributions import Distribution
 
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Gradient Reversal Layer for adversarial training
+# -----------------------------------------------------------------------------
+class _GRL(Function):
+    """Gradient Reversal Layer for adversarial batch prediction."""
+    @staticmethod
+    def forward(ctx, x, lambd: float):
+        ctx.lambd = float(lambd)
+        return x.view_as(x)
+    
+    @staticmethod
+    def backward(ctx, grad):
+        return -ctx.lambd * grad, None
 
-class ResidualFCLayers(nn.Module):
-    """Custom FCLayers with residual connections."""
+# -----------------------------------------------------------------------------
+# Helper function for broadcasting tensors
+# -----------------------------------------------------------------------------
+def _broadcast_like(t: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure t matches like's dimensionality for concatenation:
+    - If like is [B, *], return t shaped [B, K]
+    - If like is [S, B, *], return t shaped [S, B, K] by expanding only across S
+    Assumes t encodes per-sample info (batch_one_hot, cond one-hot, cont covs).
+    """
+    # Make t 2D: [B, K]
+    if t.dim() == 1:
+        t = t.unsqueeze(1)              # [B] -> [B, 1]
+    elif t.dim() == 3 and t.size(0) == 1:
+        t = t.squeeze(0)                # [1, B, K] -> [B, K]
+    elif t.dim() != 2:
+        raise RuntimeError(f"Expected t to be 1D/2D (or [1,B,K]), got shape {tuple(t.shape)}")
+
+    if like.dim() == 2:
+        # z is [B, L] -> return [B, K]
+        return t
+    elif like.dim() == 3:
+        # z is [S, B, L] -> return [S, B, K]
+        return t.unsqueeze(0).expand(like.size(0), -1, -1)
+    else:
+        raise RuntimeError(f"Unsupported 'like' rank: {like.dim()} with shape {tuple(like.shape)}")
+
+
+# -----------------------------------------------------------------------------
+# Building blocks: Residual MLP without BatchNorm (LayerNorm optional)
+# -----------------------------------------------------------------------------
+class ResidualMLP(nn.Module):
+    """A simple residual MLP used for encoder/decoder.
+
+    Design choices:
+    - **No BatchNorm**: BN interacts with mini-batch composition and can leak batch effects.
+    - **Optional LayerNorm**: helps stabilize optimization on heterogeneous continuous features.
+    - **Residual connections**: encourage gradient flow and preserve information when widths match.
+
+    Parameters
+    ----------
+    n_in : int
+        Input dimensionality.
+    n_out : int
+        Output dimensionality.
+    n_hidden : int
+        Width of hidden layers.
+    n_layers : int
+        Number of linear layers (>=1). If 1, it is just a linear map.
+    dropout : float
+        Dropout rate applied after ReLU (not on the output layer).
+    use_layer_norm : bool
+        Whether to apply LayerNorm after linear transformations (encoder-friendly).
+    """
+
     def __init__(
         self,
         n_in: int,
         n_out: int,
-        n_cat_list: list[int] | None = None,
-        n_layers: int = 1,
-        n_hidden: int = 128,
-        dropout_rate: float = 0.1,
-        inject_covariates: bool = True,
-        use_batch_norm: bool = False,
+        *,
+        n_hidden: int = 256,
+        n_layers: int = 2,
+        dropout: float = 0.1,
         use_layer_norm: bool = False,
-    ):
+    ) -> None:
         super().__init__()
-        self.layers = nn.ModuleList()
-        for i in range(n_layers):
-            in_dim = n_in if i == 0 else n_hidden
-            out_dim = n_hidden if i < n_layers - 1 else n_out
-            layer = nn.Linear(in_dim, out_dim)
-            self.layers.append(layer)
-            if use_batch_norm:
-                self.layers.append(nn.BatchNorm1d(out_dim))
-            if use_layer_norm:
-                self.layers.append(nn.LayerNorm(out_dim))
-            if dropout_rate > 0 and i < n_layers - 1:
-                self.layers.append(nn.Dropout(dropout_rate))
-            self.layers.append(nn.ReLU())
-            if in_dim == out_dim and i < n_layers - 1:
-                self.layers.append(nn.Identity())
-        self.inject_covariates = inject_covariates
-        self.n_cat_list = n_cat_list or []
+        assert n_layers >= 1, "n_layers must be >= 1"
 
-    def forward(self, x: torch.Tensor, *cat_list: torch.Tensor):
+        dims = [n_in] + [n_hidden] * (n_layers - 1) + [n_out]
+
+        self.use_layer_norm = use_layer_norm
+        self.dropout = dropout
+
+        self.fcs = nn.ModuleList()
+        self.lns = nn.ModuleList() if use_layer_norm else None
+        self.activ = nn.ReLU()
+
+        for i in range(n_layers):
+            self.fcs.append(nn.Linear(dims[i], dims[i + 1]))
+            if use_layer_norm and i < n_layers - 1:
+                self.lns.append(nn.LayerNorm(dims[i + 1]))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x
-        for i, layer in enumerate(self.layers):
-            if isinstance(layer, nn.Linear):
-                h_prev = h
-                h = layer(h)
-                if h_prev.shape == h.shape:
-                    h = h + h_prev
-            else:
-                h = layer(h)
-            if self.inject_covariates and cat_list and i < len(self.n_cat_list):
-                cat = cat_list[i]
-                if cat is not None:
-                    h = h + torch.nn.functional.one_hot(cat.long(), self.n_cat_list[i]).float()
+        for i, fc in enumerate(self.fcs):
+            h_in = h
+            h = fc(h)
+            is_last = (i == len(self.fcs) - 1)
+            if not is_last:
+                if self.use_layer_norm:
+                    h = self.lns[i](h)  # type: ignore[index]
+                h = self.activ(h)
+                if self.dropout > 0:
+                    h = F.dropout(h, p=self.dropout, training=self.training)
+                # Residual when shapes allow (hidden -> hidden)
+                if h_in.shape == h.shape:
+                    h = h + h_in
         return h
 
 
+# -----------------------------------------------------------------------------
+# Main module: PhenoVAE
+# -----------------------------------------------------------------------------
 class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
-    """Variational auto-encoder for phenomics data with Gaussian likelihood.
+    """Variational autoencoder tailored for **continuous phenomics** features.
+
+    Core ideas implemented in this module:
+    - **Encoder** does *not* consume batch → latent `z` is encouraged to be batch-free.
+    - **Decoder** *does* consume batch (one-hot or embedding) → can reconstruct
+      batch-specific nuisance without forcing `z` to carry it.
+    - **Diagonal Gaussian likelihood**
 
     Parameters
     ----------
     n_input
-        Number of input features (phenomic features).
+        Number of input features (phenomics feature dimension).
     n_batch
-        Number of batches. If ``0``, no batch correction is performed.
+        Number of batches (distinct categories in your hierarchical batch key).
+        If ``0``, no batch conditioning is performed.
     n_hidden
-        Number of nodes per hidden layer.
+        MLP hidden width.
     n_latent
-        Dimensionality of the latent space.
+        Latent dimensionality (`z`).
     n_layers
-        Number of hidden layers.
+        Number of layers in the encoder and decoder MLPs.
     n_continuous_cov
-        Number of continuous covariates.
+        Number of continuous covariates (optional; concatenated if provided).
     n_cats_per_cov
-        A list of integers containing the number of categories for each categorical covariate.
-    n_conditions
-        Number of unique conditions for CVAE. If ``0``, standard VAE is used.
+        For additional categorical covariates (not the batch), the cardinality
+        of each covariate. (We keep this for scvi parity; not used by default.)
     dropout_rate
-        Dropout rate.
+        Dropout rate in MLPs.
     encode_covariates
-        If ``True``, covariates are concatenated to features prior to encoding.
+        If ``True``, concatenates covariates to the **encoder** inputs. We recommend
+        keeping this **False** for batch to avoid leakage into `z`.
     deeply_inject_covariates
-        If ``True`` and ``n_layers > 1``, covariates are concatenated to hidden layer outputs.
+        Not used here (kept for API parity). Prefer simplicity initially.
     batch_representation
-        Method for encoding batch information. One of ``"one-hot"`` or ``"embedding"``.
-    condition_representation
-        Method for encoding condition information. One of ``"one-hot"`` or ``"embedding"``.
+        "one-hot" or "embedding". Determines how batch enters the **decoder**.
     use_batch_norm
-        Specifies where to use :class:`~torch.nn.BatchNorm1d` in the model.
+        Ignored here; we intentionally avoid BatchNorm. Kept for API compatibility.
     use_layer_norm
-        Specifies where to use :class:`~torch.nn.LayerNorm` in the model.
-    var_activation
-        Callable used to ensure positivity of the variance of the variational distribution.
-    output_var_param
-        How to parameterize the output variance. One of:
-        * ``"learned"``: learn a single variance parameter per feature
-        * ``"fixed"``: use a fixed variance of 1.0
-        * ``"feature"``: learn separate variance for each feature
-    control_only_training
-        If ``True``, the model is only used for control and not for training.
-    use_corr_loss
-        If ``True``, adds adversarial correlation loss for batch disentanglement.
+        Where to apply LayerNorm: "encoder", "decoder", "both", or "none".
+        Default recommended: "encoder".
+    recon_beta
+        Weight on reconstruction loss. Keep at 1.0; rely on KL annealing instead.
+    batch_embedding_kwargs
+        Extra kwargs for batch embedding layer (if `batch_representation="embedding"`).
+    adv_batch_weight
+        Weight for adversarial batch prediction loss on latent z. When > 0, adds gradient
+        reversal to penalize batch information in z. 0.0 = disabled (recommended initially).
     """
 
     def __init__(
         self,
         n_input: int,
         n_batch: int = 0,
-        n_hidden: int = 128,
+        n_hidden: int = 256,
         n_latent: int = 128,
-        n_layers: int = 1,
+        n_layers: int = 2,
         n_continuous_cov: int = 0,
-        n_cats_per_cov: list[int] | None = None,
-        n_conditions: int = 0,
+        n_cats_per_cov: Optional[list[int]] = None,
         dropout_rate: float = 0.1,
-        encode_covariates: bool = False,
-        deeply_inject_covariates: bool = False,
-        batch_representation: Literal["one-hot", "embedding"] = "one-hot",
-        condition_representation: Literal["one-hot", "embedding"] = "embedding",
-        use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
-        use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
-        var_activation: Callable[[torch.Tensor], torch.Tensor] = None,
-        output_var_param: Literal["learned", "fixed", "feature"] = "feature",
-        var_reg_lambda: float = 0.01,
+        encode_covariates: bool = False,  # IMPORTANT: batch should *not* feed encoder
+        deeply_inject_covariates: bool = False,  # kept for API parity
+        batch_representation: Literal["one-hot", "embedding"] = "embedding",
+        use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "none",  # ignored (no BN)
+        use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "encoder",
         recon_beta: float = 1.0,
-        batch_embedding_kwargs: dict | None = None,
-        condition_embedding_kwargs: dict | None = None,
-        control_only_training: bool = False,
-        use_corr_loss: bool = False,
-    ):
+        batch_embedding_kwargs: Optional[dict] = None,
+        adv_batch_weight: float = 0.0,
+    ) -> None:
         super().__init__()
 
+        # ---- Basic config & state ------------------------------------------
+        self.n_input = n_input
         self.n_latent = n_latent
         self.n_batch = n_batch
-        self.n_input = n_input
-        self.n_conditions = n_conditions
+        self.n_continuous_cov = n_continuous_cov
         self.encode_covariates = encode_covariates
-        self.output_var_param = output_var_param
-        self.var_reg_lambda = var_reg_lambda
-        self.recon_beta = recon_beta
-        self.is_cvae = n_conditions > 0
-        self.control_only_training = control_only_training
-        self.use_corr_loss = use_corr_loss
-
-        # Initialize output variance parameters
-        if self.output_var_param == "learned":
-            self.px_log_var = torch.nn.Parameter(torch.full((1,), -2.3))
-        elif self.output_var_param == "feature":
-            self.px_log_var = torch.nn.Parameter(torch.zeros((n_input,)))
-        elif self.output_var_param == "fixed":
-            self.px_log_var = None
-        else:
-            raise ValueError("output_var_param must be 'learned', 'fixed', or 'feature'")
-
+        self.deeply_inject_covariates = deeply_inject_covariates  # not used internally
         self.batch_representation = batch_representation
-        if self.batch_representation == "embedding":
+        self.recon_beta = recon_beta
+        self.adv_batch_weight = float(adv_batch_weight)
+
+        # ---- Adversarial batch head on z (with GRL) -------------------------
+        if self.adv_batch_weight > 0.0 and self.n_batch > 1:
+            self._adv_head = nn.Linear(n_latent, self.n_batch)
+        else:
+            self._adv_head = None
+
+        # ---- Embeddings for batch/condition (decoder-side) -----------------
+        # Batch: either embedding (compact) or one-hot (simple).
+        if self.batch_representation == "embedding" and self.n_batch > 0:
             self.init_embedding(REGISTRY_KEYS.BATCH_KEY, n_batch, **(batch_embedding_kwargs or {}))
             batch_dim = self.get_embedding(REGISTRY_KEYS.BATCH_KEY).embedding_dim
         else:
-            batch_dim = n_batch
+            batch_dim = self.n_batch  # for one-hot concat (0 if no batch)
+      
+        # ---- Encoder: NO batch input (by design) ---------------------------
+        # Construct encoder input dimensionality:
+        #   X [+ cont_covs (if encode_covariates)].
+        enc_in_dim = n_input
+        if self.encode_covariates and self.n_continuous_cov > 0:
+            enc_in_dim += self.n_continuous_cov
 
-        self.condition_representation = condition_representation
-        condition_dim = 0
-        if self.is_cvae:
-            if self.condition_representation == "embedding":
-                self.init_embedding("condition", n_conditions, **(condition_embedding_kwargs or {}))
-                condition_dim = self.get_embedding("condition").embedding_dim
-            else:
-                condition_dim = n_conditions
-
-        use_batch_norm_encoder = use_batch_norm in ["encoder", "both"]
-        use_batch_norm_decoder = use_batch_norm in ["decoder", "both"]
-        use_layer_norm_encoder = use_layer_norm in ["encoder", "both"]
-        use_layer_norm_decoder = use_layer_norm in ["decoder", "both"]
-
-        n_input_encoder = n_input + n_continuous_cov * encode_covariates
-        n_input_encoder += batch_dim * encode_covariates
-        cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
-        if self.batch_representation != "embedding":
-            cat_list = [n_batch] + cat_list
-        if self.is_cvae and self.condition_representation == "one-hot":
-            n_input_encoder += condition_dim
-            cat_list = [n_conditions] + cat_list
-        if self.is_cvae and self.condition_representation == "embedding" and self.encode_covariates:
-            n_input_encoder += condition_dim
-
-        encoder_cat_list = cat_list if encode_covariates else None
-
-        self.z_encoder = ResidualFCLayers(
-            n_in=n_input_encoder,
-            n_out=n_latent * 2,
-            n_cat_list=encoder_cat_list,
-            n_layers=n_layers,
+        use_ln_encoder = use_layer_norm in {"encoder", "both"}
+        self.z_encoder = ResidualMLP(
+            n_in=enc_in_dim,
+            n_out=2 * n_latent,  # outputs [mu, v_param] chunks
             n_hidden=n_hidden,
-            dropout_rate=dropout_rate,
-            inject_covariates=deeply_inject_covariates,
-            use_batch_norm=use_batch_norm_encoder,
-            use_layer_norm=use_layer_norm_encoder,
+            n_layers=n_layers,
+            dropout=dropout_rate,
+            use_layer_norm=use_ln_encoder,
         )
 
-        n_input_decoder = n_latent + n_continuous_cov + batch_dim
-        if self.is_cvae:
-            n_input_decoder += condition_dim
+        # ---- Decoder: z + batch + cont_covs ---------------------------------
+        # Decoder explicitly conditions on batch to explain batch-specific variance.
+        dec_in_dim = n_latent
+        if self.n_continuous_cov > 0:
+            dec_in_dim += self.n_continuous_cov
+        if self.n_batch > 0:
+            dec_in_dim += (batch_dim if self.batch_representation == "embedding" else self.n_batch)
 
-        self.decoder = ResidualFCLayers(
-            n_in=n_input_decoder,
+        use_ln_decoder = use_layer_norm in {"decoder", "both"}
+        self.decoder = ResidualMLP(
+            n_in=dec_in_dim,
             n_out=n_input,
-            n_cat_list=cat_list,
-            n_layers=n_layers,
             n_hidden=n_hidden,
-            dropout_rate=dropout_rate,
-            inject_covariates=deeply_inject_covariates,
-            use_batch_norm=use_batch_norm_decoder,
-            use_layer_norm=use_layer_norm_decoder,
+            n_layers=n_layers,
+            dropout=dropout_rate,
+            use_layer_norm=use_ln_decoder,
         )
 
+    # ----------------------------------------------------------------------
+    # Helpers to assemble inputs for inference/generative (scvi API parity)
+    # ----------------------------------------------------------------------
     def _get_inference_input(
         self,
         tensors: dict[str, torch.Tensor | None],
     ) -> dict[str, torch.Tensor | None]:
-        """Get input tensors for the inference process."""
-        input_dict = {
+        """Select tensors used by `inference` (encoder forward).
+
+        NOTE: We **do not** supply batch to the encoder here (by design).
+        """
+        return {
             MODULE_KEYS.X_KEY: tensors[REGISTRY_KEYS.X_KEY],
-            MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
+            MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],  # kept for shape checks only
             MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None),
             MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None),
         }
-        if self.is_cvae:
-            input_dict["condition_index"] = tensors.get("condition", None)
-        return input_dict
 
     def _get_generative_input(
         self,
         tensors: dict[str, torch.Tensor],
         inference_outputs: dict[str, torch.Tensor | Distribution | None],
     ) -> dict[str, torch.Tensor | None]:
-        """Get input tensors for the generative process."""
-        input_dict = {
+        """Select tensors used by `generative` (decoder forward)."""
+        return {
             MODULE_KEYS.Z_KEY: inference_outputs[MODULE_KEYS.Z_KEY],
             MODULE_KEYS.BATCH_INDEX_KEY: tensors[REGISTRY_KEYS.BATCH_KEY],
             MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None),
             MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None),
         }
-        if self.is_cvae:
-            input_dict["condition_index"] = tensors.get("condition", None)
-        return input_dict
 
+    # ----------------------------------------------------------------------
+    # Core forward passes
+    # ----------------------------------------------------------------------
     @auto_move_data
     def inference(
         self,
         x: torch.Tensor,
-        batch_index: torch.Tensor,
+        batch_index: torch.Tensor,  # not used as encoder input; checked for bounds
         cont_covs: torch.Tensor | None = None,
-        cat_covs: torch.Tensor | None = None,
-        condition_index: torch.Tensor | None = None,
+        cat_covs: torch.Tensor | None = None,  # kept for API parity; unused here
         n_samples: int = 1,
     ) -> dict[str, torch.Tensor | Distribution | None]:
-        """Run the inference process with batch index validation."""
-        batch_index = batch_index.long()
-        if batch_index.max() >= self.n_batch or batch_index.min() < 0:
-            raise ValueError(f"batch_index out of bounds: max={batch_index.max()}, min={batch_index.min()}, n_batch={self.n_batch}")
+        """Encoder forward pass producing q(z|x, covs) without batch input.
 
-        encoder_inputs = [x]
-        categorical_inputs = []
-        if cont_covs is not None and self.encode_covariates:
-            encoder_inputs.append(cont_covs)
-        if self.batch_representation == "embedding" and self.encode_covariates:
-            batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
-            encoder_inputs.append(batch_rep)
-        else:
-            categorical_inputs.append(batch_index)
-        if self.is_cvae and condition_index is not None:
-            condition_index = condition_index.long()
-            if self.condition_representation == "embedding":
-                condition_rep = self.compute_embedding("condition", condition_index)
-                encoder_inputs.append(condition_rep)
-            else:
-                categorical_inputs.append(condition_index)
-        if cat_covs is not None and self.encode_covariates:
-            categorical_inputs.extend(torch.split(cat_covs, 1, dim=1))
+        Returns
+        -------
+        dict with:
+            - MODULE_KEYS.QZ_KEY: Normal(loc=mu, scale=sigma)
+            - MODULE_KEYS.Z_KEY: rsample(s) from q(z|x)
+        """
+        # Basic sanity for batch indices (protect against out-of-bounds)
+        if self.n_batch > 0:
+            b = batch_index.long().view(-1)
+            if b.numel() > 0 and (b.max() >= self.n_batch or b.min() < 0):
+                raise ValueError(
+                    f"batch_index out of bounds: min={int(b.min())}, max={int(b.max())}, n_batch={self.n_batch}"
+                )
 
-        encoder_input = torch.cat(encoder_inputs, dim=-1)
-        qz_params = self.z_encoder(encoder_input, *categorical_inputs)
-        qz_m, qz_v = qz_params.chunk(2, dim=-1)
-        qz = Normal(qz_m, torch.nn.functional.softplus(qz_v) + 1e-6)
+        enc_inputs = [x]
+
+        # Optional continuous covariates concatenation (keep minimal by default).
+        if self.encode_covariates and cont_covs is not None:
+            enc_inputs.append(cont_covs)
+
+
+        enc_in = torch.cat(enc_inputs, dim=-1) if len(enc_inputs) > 1 else enc_inputs[0]
+
+        # Produce q(z|·): chunk into (mu, v_param). Use softplus to ensure positive std.
+        qz_params = self.z_encoder(enc_in)
+        qz_mu, qz_vparam = qz_params.chunk(2, dim=-1)
+        qz_scale = F.softplus(qz_vparam) + 1e-6  # strictly positive
+        qz = Normal(qz_mu, qz_scale)
+
         z = qz.rsample() if n_samples == 1 else qz.rsample((n_samples,))
-
-        return {MODULE_KEYS.Z_KEY: z, MODULE_KEYS.QZ_KEY: qz}
+        return {MODULE_KEYS.QZ_KEY: qz, MODULE_KEYS.Z_KEY: z}
 
     @auto_move_data
     def generative(
@@ -312,53 +417,48 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         batch_index: torch.Tensor,
         cont_covs: torch.Tensor | None = None,
         cat_covs: torch.Tensor | None = None,
-        condition_index: torch.Tensor | None = None,
-    ) -> dict[str, Distribution | None]:
-        """Run the generative process with batch index validation."""
-        batch_index = batch_index.long()
-        if batch_index.max() >= self.n_batch or batch_index.min() < 0:
-            raise ValueError(f"batch_index out of bounds: max={batch_index.max()}, min={batch_index.min()}, n_batch={self.n_batch}")
+    ) -> Dict[str, Union[Distribution, torch.Tensor, None]]:
+        """Decoder forward pass producing p(x|z, batch, covs). Batch **is used here**."""
+        # --- validate + normalize index shapes ---
+        batch_index = batch_index.long().view(-1)  # [B]
+        if self.n_batch > 0 and (batch_index.max() >= self.n_batch or batch_index.min() < 0):
+            raise ValueError(
+                f"batch_index out of bounds: max={batch_index.max()}, min={batch_index.min()}, n_batch={self.n_batch}"
+            )
 
-        decoder_inputs = [z]
-        categorical_inputs = []
+        dec_inputs: list[torch.Tensor] = [z]
+        # We keep cat_covs for API parity, but do not inject them into the decoder.
+        # ResidualMLP.forward(x) only accepts a single tensor.
+
+        # --- continuous covariates ---
         if cont_covs is not None:
-            if z.dim() != cont_covs.dim():
-                decoder_inputs.append(cont_covs.unsqueeze(0).expand(z.size(0), -1, -1))
+            # cont_covs is typically [B, C]; match z's rank and dtype
+            dec_inputs.append(_broadcast_like(cont_covs.to(z.dtype), z))
+
+        # --- batch conditioning goes to the DECODER ---
+        b_rep = None  # Will store batch representation for reuse
+        if self.n_batch > 0:
+            if self.batch_representation == "embedding":
+                b_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index).to(z.dtype)  # [B, E]
             else:
-                decoder_inputs.append(cont_covs)
-        if self.batch_representation == "embedding":
-            batch_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index)
-            decoder_inputs.append(batch_rep)
-        else:
-            categorical_inputs.append(batch_index)
-        if self.is_cvae and condition_index is not None:
-            condition_index = condition_index.long()
-            if self.condition_representation == "embedding":
-                condition_rep = self.compute_embedding("condition", condition_index)
-                decoder_inputs.append(condition_rep)
-            else:
-                categorical_inputs.append(condition_index)
-        if cat_covs is not None:
-            categorical_inputs.extend(torch.split(cat_covs, 1, dim=1))
+                b_rep = F.one_hot(batch_index, num_classes=self.n_batch).to(z.dtype)  # [B, n_batch]
+            dec_inputs.append(_broadcast_like(b_rep, z))
 
-        decoder_input = torch.cat(decoder_inputs, dim=-1)
-        px_mean = self.decoder(decoder_input, *categorical_inputs)
 
-        if self.output_var_param == "fixed":
-            px_var = torch.ones_like(px_mean)
-        elif self.output_var_param == "learned":
-            log_var_clamped = torch.clamp(self.px_log_var, min=-10, max=2)
-            px_var = torch.exp(log_var_clamped) * torch.ones_like(px_mean)
-        else:  # "feature"
-            log_var_clamped = torch.clamp(self.px_log_var, min=-10, max=2)
-            px_var = torch.exp(log_var_clamped).unsqueeze(0).expand_as(px_mean)
+        dec_input = torch.cat(dec_inputs, dim=-1)
 
-        px_var = torch.clamp(px_var, min=1e-6, max=100.0)
-        px_std = torch.sqrt(px_var)
+        px_mean = self.decoder(dec_input)
+
+
+        # --- Simple diagonal Gaussian (temporary - will be replaced with decoder head) ---
+        px_std = torch.ones_like(px_mean)
         px = Normal(px_mean, px_std)
 
-        return {MODULE_KEYS.PX_KEY: px}
+        return {MODULE_KEYS.PX_KEY: px, "px_mean": px_mean}  # expose px_mean for debugging
 
+    # ----------------------------------------------------------------------
+    # Loss
+    # ----------------------------------------------------------------------
     def loss(
         self,
         tensors: dict[str, torch.Tensor],
@@ -367,71 +467,82 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         kl_weight: float = 1.0,
         **kwargs,
     ) -> LossOutput:
-        """Compute the loss for phenomics VAE with KL annealing and correlation loss."""
-        if kwargs and not hasattr(self, '_logged_kwargs'):
-            print(f"DEBUG: Loss function received additional kwargs: {list(kwargs.keys())}")
-            self._logged_kwargs = True
+        """Standard VAE loss for continuous phenomics: recon + KL
 
-        x = tensors[REGISTRY_KEYS.X_KEY]
-        px = generative_outputs[MODULE_KEYS.PX_KEY]
-        qz = inference_outputs[MODULE_KEYS.QZ_KEY]
+        We *intentionally* keep this simple and stable. KL annealing should be
+        handled by the training plan through the `kl_weight` argument, which
+        scvi-tools passes here (e.g., linear/sigmoid ramp from 0→1).
 
-        log_likelihood = px.log_prob(x).sum(-1)
-        reconst_loss = -log_likelihood
-        var_reg = self.var_reg_lambda * torch.mean(px.scale)
-        reconst_loss = self.recon_beta * reconst_loss + var_reg
+        Returns
+        -------
+        LossOutput with:
+          - loss: scalar objective
+          - reconstruction_loss: per-item reconstruction terms (for logging)
+          - kl_local: dict containing per-item KL terms
+          - extra_metrics: useful scalars for monitoring
+        """
+        px = generative_outputs[MODULE_KEYS.PX_KEY]                  # Normal(mean, std)
+        qz = inference_outputs[MODULE_KEYS.QZ_KEY]                   # Normal(mu, std)
+        x = tensors[REGISTRY_KEYS.X_KEY].to(px.loc.dtype)           # align dtype with px_mean
 
-        kl_divergence_z = torch.distributions.kl_divergence(
-            qz, Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale))
-        ).sum(dim=1)
+        # Reconstruction: negative log likelihood under Gaussian
+        log_likelihood = px.log_prob(x).sum(-1)                     # sum over features -> [B] or [S,B]
+        # If multiple samples, average over the sample dimension first
+        if log_likelihood.dim() == 2:
+            log_likelihood = log_likelihood.mean(0)                 # [S,B] -> [B]
+        reconst_loss = self.recon_beta * (-log_likelihood)
 
-        kl_anneal_epochs = kwargs.get('kl_anneal_epochs', 0)
-        current_epoch = getattr(self, '_current_epoch', 0)
-        effective_kl_weight = min(1.0, current_epoch / kl_anneal_epochs) if kl_anneal_epochs > 0 else kl_weight
+        var_penalty = torch.tensor(0.0, device=x.device) # arbitrary
 
-        # Ensure tensors are proper shape for LossOutput
-        mean_reconst_loss = torch.mean(reconst_loss)
-        mean_kl_loss = torch.mean(kl_divergence_z)
-        
-        corr_loss = torch.tensor(0.0, device=x.device)
-        if hasattr(self, 'use_corr_loss') and self.use_corr_loss:
-            batch_id = tensors.get(REGISTRY_KEYS.BATCH_KEY, torch.zeros_like(x[:, 0])).float()
-            z = inference_outputs[MODULE_KEYS.Z_KEY]
-            
-            # Handle both 2D and 3D z tensors
-            if z.dim() == 3:  # Shape: [n_samples, batch_size, n_latent]
-                n_samples = z.size(0)
-                # Expand batch_id to match n_samples dimension, then add feature dimension
-                batch_id = batch_id.unsqueeze(0).expand(n_samples, -1).unsqueeze(-1)  # Shape: [n_samples, batch_size, 1]
-                z = z.view(-1, z.size(-1))  # Flatten to [n_samples * batch_size, n_latent]
-                batch_id = batch_id.view(-1, 1)  # Flatten to [n_samples * batch_size, 1]
-            else:  # Shape: [batch_size, n_latent]
-                # batch_id is already [batch_size], just need to add feature dimension
-                if batch_id.dim() == 1:
-                    batch_id = batch_id.unsqueeze(-1)  # Shape: [batch_size, 1]
-                # If batch_id is already [batch_size, 1], keep it as is
-            
-            corr_matrix = torch.corrcoef(torch.cat([z, batch_id], dim=-1).T)
-            corr_loss = torch.abs(corr_matrix[:-1, -1]).mean() * 0.005
+        # KL divergence between q(z|x) and N(0, I)
+        prior = Normal(loc=torch.zeros_like(qz.loc), scale=torch.ones_like(qz.scale))
+        kl_div_z = torch.distributions.kl_divergence(qz, prior).sum(dim=1)
 
-        total_loss = mean_reconst_loss + effective_kl_weight * mean_kl_loss + corr_loss
+        # Let training plan drive annealing via kl_weight
+        effective_kl_weight = float(kwargs.get("kl_weight", kl_weight))
 
-        # Use the same format as the standard VAE implementation
+        total = reconst_loss.mean() + effective_kl_weight * kl_div_z.mean() + var_penalty
+
+        # ---- Optional adversarial loss to remove batch from z ---------------
+        adv_w = float(kwargs.get("adv_weight", self.adv_batch_weight or 0.0))
+        adv_loss_val = torch.tensor(0.0, device=x.device)
+        if adv_w > 0.0 and self._adv_head is not None and self.n_batch > 1:
+            z_for_adv = inference_outputs[MODULE_KEYS.Z_KEY]
+            if z_for_adv.dim() == 3:  # [S,B,L] → [B,L]
+                z_for_adv = z_for_adv.mean(0)
+            # Reverse encoder gradients only; classifier learns normally
+            z_inv = _GRL.apply(z_for_adv, 1.0)
+            logits = self._adv_head(z_inv)  # [B, n_batch]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY].long().view(-1)
+            adv_loss_val = F.cross_entropy(logits, batch_index)
+            total = total + adv_w * adv_loss_val
+
         return LossOutput(
-            loss=total_loss,
-            reconstruction_loss=reconst_loss,  # Pass the full tensor, not the mean
-            kl_local={MODULE_KEYS.KL_Z_KEY: kl_divergence_z},  # Pass the full tensor, not the mean
-            extra_metrics={"corr_loss": corr_loss}
+            loss=total,
+            reconstruction_loss=reconst_loss,                 # per-item tensor
+            kl_local={MODULE_KEYS.KL_Z_KEY: kl_div_z},        # per-item tensor
+            extra_metrics={
+                "kl_weight": torch.tensor(effective_kl_weight, device=x.device),
+                "reconst_mean": reconst_loss.mean(),
+                "kl_mean": kl_div_z.mean(),
+                "adv_loss": adv_loss_val,
+            },
         )
 
+    # ----------------------------------------------------------------------
+    # Sampling utility
+    # ----------------------------------------------------------------------
     @torch.inference_mode()
     def sample(
         self,
         tensors: dict[str, torch.Tensor],
         n_samples: int = 1,
     ) -> torch.Tensor:
-        """Sample from the generative model."""
-        inference_outputs = self.inference(**self._get_inference_input(tensors), n_samples=n_samples)
-        generative_outputs = self.generative(**self._get_generative_input(tensors, inference_outputs))
-        px = generative_outputs[MODULE_KEYS.PX_KEY]
+        """Sample x ~ p(x|z, batch, ...) by ancestral sampling from q(z|x)."""
+        inf = self.inference(**self._get_inference_input(tensors), n_samples=n_samples)
+        gen = self.generative(**self._get_generative_input(tensors, inf))
+        px = gen[MODULE_KEYS.PX_KEY]
         return px.sample()
+    
+
+__all__ = ["PhenoVAE"]

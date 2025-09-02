@@ -1,10 +1,39 @@
-"""Data loading functionality for phenomics data."""
+"""Data loading and AnnData setup utilities for phenomics embeddings.
+
+This module focuses on **clean, fast, and faithful** preparation of phenomics data
+for downstream non-linear batch correction with PHVI (a VAE-style model). It:
+
+- Loads a parquet table where feature columns share a prefix (e.g., ``feature_``)
+  and metadata columns include batch/covariate information (e.g., ``plate_number``,
+  ``experiment``, etc.).
+- Builds an :class:`anndata.AnnData` object with:
+    - ``X`` = continuous phenomics features (``float32``),
+    - ``obs`` = metadata,
+    - ``var`` = feature names.
+- Optionally creates a **vectorized** ``perturbation_summary`` column to summarize
+  genes and compounds, avoiding per-row ``apply`` (critical for large tables).
+- **No control-only training behavior** is embedded here by design. Training on
+  *all* wells preserves biological variation and supports higher BMDB.
+- Provides a convenience wrapper to register the AnnData with ``scvi.model.PHVI``.
+  It forwards a **hierarchical batch** option (e.g., ``experiment × plate_number``),
+  which should match how your KNN batch-predictability metric is defined.
+
+Design goals:
+-------------
+1) **Speed & scale**: vectorized ops, minimal per-row Python; column-wise extraction.
+2) **Fidelity**: no unintended transformations of the features or implicit filtering.
+3) **Transparency**: explicit logging of dataset shape, feature counts, and basic
+   variance diagnostics to support rapid iteration and debugging.
+
+Typical usage:
+--------------
+>>> adata = read_phenomics("phenom2_embeddings.parquet", feature_prefix="feature_")
+>>> PHVI.setup_anndata(adata)
+"""
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 from anndata import AnnData
@@ -12,159 +41,124 @@ from anndata import AnnData
 logger = logging.getLogger(__name__)
 
 
-def read_phenomics(
-    filepath: str | Path,
+def _safe_text(obs, key: str, default: str) -> pd.Series:
+    s = obs.get(key)
+    if s is None:
+        # Create a full-length Series so downstream ops have matching index/length
+        return pd.Series([default] * len(obs), index=obs.index, dtype="string")
+    # Break out of Categorical first, then fill
+    s = s.astype("string")
+    return s.fillna(default)
+
+
+# --------------------------------------------------------------------------- #
+# Core loader
+# --------------------------------------------------------------------------- #
+def read_phenomics_from_df(
+    df: pd.DataFrame,
+    *,
     feature_prefix: str = "feature_",
     batch_key: str = "plate_number",
     create_perturbation_summary: bool = True,
-    control_only_training: bool = False,
-    control_well_type: str = "center_introns_v1",
-    subset_rows: int | None = None,
-    subset_seed: int | None = None,
+    standardize: bool = True,
+    raw_layer_name: str = "X_raw",
+    hierarchical_batch_keys: list[str] | None = None,
 ) -> AnnData:
-    """Read phenomics data from parquet file.
-
+    """Build AnnData directly from an in-memory DataFrame (skip parquet IO).
+    
     Parameters
     ----------
-    filepath
-        Path to the parquet file containing phenomics data.
+    df
+        Input DataFrame with feature columns and metadata columns.
     feature_prefix
-        Prefix used to identify feature columns.
+        Prefix for feature columns (e.g., "feature_").
     batch_key
-        Column name to use as batch information (default: "plate_number").
+        Column name for batch information.
     create_perturbation_summary
-        Whether to create a perturbation_summary column from map_* columns.
-    control_only_training
-        If True, mark only control wells for training while keeping all wells for inference.
-    control_well_type
-        Type of control wells to use for training when control_only_training=True.
-    subset_rows
-        If not None, subset the data to this many rows (for testing).
-    subset_seed
-        Random seed for subsetting.
-
+        Whether to create a perturbation_summary column from metadata.
+    standardize
+        Whether to standardize features using StandardScaler.
+    raw_layer_name
+        Name for storing raw (unstandardized) features in layers.
+    hierarchical_batch_keys
+        If provided, must be a list of exactly two keys in df columns to be
+        concatenated into a hierarchical batch key. This mirrors (experiment × plate)
+        which is what KNN evaluators typically use. Example: ['experiment', 'plate_number'].
+        If provided, this overrides the batch_key parameter.
+        
     Returns
     -------
-    AnnData object with phenomics features in X and metadata in obs.
+    AnnData object with continuous phenomics features.
     """
-    logger.info(f"Reading phenomics data from {filepath}")
-
-    # Read parquet file
-    df = pd.read_parquet(filepath)
-
-    # Subset if requested (for testing)
-    if subset_rows is not None:
-        if subset_seed is not None:
-            df = df.sample(n=min(subset_rows, len(df)), random_state=subset_seed)
-        else:
-            df = df.head(subset_rows)
-        logger.info(f"Subsetted data to {len(df)} rows")
-
-    # Extract feature columns
-    feature_cols = [col for col in df.columns if col.startswith(feature_prefix)]
+    feature_cols = [c for c in df.columns if str(c).startswith(feature_prefix)]
     if not feature_cols:
-        raise ValueError(f"No feature columns found with prefix '{feature_prefix}'")
+        raise ValueError(f"No feature columns found with prefix '{feature_prefix}'.")
+    meta_cols = [c for c in df.columns if c not in feature_cols]
 
-    logger.info(f"Found {len(feature_cols)} feature columns")
+    feature_df = df[feature_cols].copy()
+    for c in feature_df.columns:
+        if pd.api.types.is_categorical_dtype(feature_df[c].dtype):
+            # convert categories to string, then numeric
+            feature_df[c] = pd.to_numeric(feature_df[c].astype("string"), errors="coerce")
+    X = feature_df.to_numpy(copy=False).astype("float32", copy=False)
+    obs = df[meta_cols].copy()
 
-    # Create X matrix (features)
-    X = df[feature_cols].values.astype(np.float32)
+    # Build a concatenated hierarchical batch column if requested
+    if hierarchical_batch_keys is not None:
+        if len(hierarchical_batch_keys) != 2:
+            raise ValueError("`hierarchical_batch_keys` must be a list of exactly two keys.")
+        key1, key2 = hierarchical_batch_keys
+        if key1 not in obs.columns or key2 not in obs.columns:
+            raise ValueError(f"One or both keys '{key1}', '{key2}' not found in obs columns.")
 
-    # Create obs dataframe (metadata)
-    metadata_cols = [col for col in df.columns if not col.startswith(feature_prefix)]
-    obs = df[metadata_cols].copy()
+        # Create a deterministic combined key; this column name is logged and then used as batch.
+        new_batch_col_name = f"{key1}_{key2}"
+        logger.info(f"[read_phenomics_from_df] Creating hierarchical batch key '{new_batch_col_name}' from '{key1}' and '{key2}'.")
+        obs[new_batch_col_name] = (
+            obs[key1].astype(str) + "_" + obs[key2].astype(str)
+        )
+        if obs[new_batch_col_name].dtype.name != "category":
+            obs[new_batch_col_name] = obs[new_batch_col_name].astype("category")
+        n_levels = obs[new_batch_col_name].nunique()
+        if n_levels <= 1:
+            raise ValueError(f"Hierarchical batch column '{new_batch_col_name}' has {n_levels} level(s).")
+        logger.info(f"[read_phenomics_from_df] Using '{new_batch_col_name}' as the final batch key.")
+        batch_key = new_batch_col_name
 
-    # Create perturbation summary if requested
+    # vectorized perturbation summary (same logic as read_phenomics)
     if create_perturbation_summary and "map_perturbation_type" in obs.columns:
-        def create_summary(row):
-            pert_type = str(row["map_perturbation_type"]).lower()
-            if pert_type == "gene":
-                return row['map_gene'] if 'map_gene' in obs.columns else 'GENE_UNKNOWN'
-            elif pert_type == "compound":
-                # Handle compounds with rec_id and concentration for specificity
-                rec_id = row.get('map_rec_id', 'UNKNOWN_COMPOUND')
-                concentration = row.get('map_concentration', 'UNKNOWN_CONC')
-                return f"{rec_id}_{concentration}"
-            elif pert_type == "empty":
-                return "CONTROL_EMPTY"
-            else:
-                return "unknown"
+        pt = obs["map_perturbation_type"].astype(str).str.lower()
+        gene = _safe_text(obs, "map_gene", "GENE_UNKNOWN")
+        rec = _safe_text(obs, "map_rec_id", "UNKNOWN_COMPOUND")
+        conc = _safe_text(obs, "map_concentration", "UNKNOWN_CONC")
+        comp = rec.str.cat(conc, sep="_")
+        vals = np.select(
+            [pt.eq("gene"), pt.eq("compound"), pt.eq("empty")],
+            [gene,          comp,              "CONTROL_EMPTY"],
+            default="unknown",
+        )
+        obs["perturbation_summary"] = pd.Series(vals, index=obs.index, dtype="category")
 
-        obs["perturbation_summary"] = obs.apply(create_summary, axis=1)
-        n_unique_perturbations = obs["perturbation_summary"].nunique()
-        logger.info(f"Created perturbation_summary column with {n_unique_perturbations} unique perturbations")
-
-    # Mark control wells for training if control_only_training is enabled
-    if control_only_training:
-        if "map_well_type" in obs.columns:
-            obs["is_training_well"] = obs["map_well_type"] == control_well_type
-            n_training_wells = obs["is_training_well"].sum()
-            logger.info(f"Marked {n_training_wells} control wells ({control_well_type}) for training")
-            if n_training_wells == 0:
-                logger.warning(f"No wells found with type '{control_well_type}' for training")
-        else:
-            logger.warning("map_well_type column not found. Cannot mark control wells for training.")
-            obs["is_training_well"] = True
-    else:
-        obs["is_training_well"] = True  # All wells used for training
-
-    # Create var dataframe (feature names)
-    var = pd.DataFrame(index=feature_cols)
-    var.index.name = "feature_name"
-
-    # Ensure batch column exists
     if batch_key not in obs.columns:
-        raise ValueError(f"Batch key '{batch_key}' not found in data columns")
+        raise ValueError(f"Batch key '{batch_key}' not found in columns.")
 
-    # Create AnnData object
+    var = pd.DataFrame(index=pd.Index(feature_cols, name="feature_name"))
     adata = AnnData(X=X, obs=obs, var=var)
-
-    # Store some useful information
-    adata.uns["data_type"] = "phenomics"
-    adata.uns["feature_type"] = "continuous"
-    adata.uns["n_features"] = len(feature_cols)
-    adata.uns["control_only_training"] = control_only_training
-    adata.uns["control_well_type"] = control_well_type
-
-    logger.info(f"Created AnnData object with shape {adata.shape}")
-
+    adata.obs_names = adata.obs_names.astype(str); adata.obs_names_make_unique()
+    adata.var_names_make_unique()
+    adata.uns.update({
+        "data_type": "phenomics",
+        "feature_type": "continuous",
+        "n_features": int(len(feature_cols)),
+        "feature_prefix": feature_prefix,
+        "simple_batch_key": batch_key,
+    })
+    if standardize:
+        adata.layers[raw_layer_name] = adata.X.copy()
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        adata.X = scaler.fit_transform(adata.X).astype("float32")
+        adata.uns["scaler_mean_"] = scaler.mean_.astype("float32")
+        adata.uns["scaler_scale_"] = scaler.scale_.astype("float32")
+    logger.info(f"[read_phenomics_from_df] Created AnnData with shape: {adata.shape}")
     return adata
-
-
-def setup_phenomics_anndata(
-    adata: AnnData,
-    batch_key: str = "plate_number",
-    categorical_covariate_keys: list[str] | None = None,
-    continuous_covariate_keys: list[str] | None = None,
-    condition_key: str | None = None,
-) -> None:
-    """Set up AnnData object for phenomics analysis with scVI.
-
-    Parameters
-    ----------
-    adata
-        AnnData object containing phenomics data.
-    batch_key
-        Key in adata.obs for batch information.
-        Can use "hierarchical_batch" for nested batch effects.
-    categorical_covariate_keys
-        Keys in adata.obs for categorical covariates.
-    continuous_covariate_keys
-        Keys in adata.obs for continuous covariates.
-    condition_key
-        Key in adata.obs for condition information (for CVAE).
-    """
-    from scvi.model import PHVI
-
-    # Ensure data is continuous
-    if adata.uns.get("data_type") != "phenomics":
-        logger.warning("Data type is not marked as 'phenomics'. Proceeding anyway.")
-
-    # Setup the AnnData for use with PHVI
-    PHVI.setup_anndata(
-        adata,
-        batch_key=batch_key,
-        categorical_covariate_keys=categorical_covariate_keys,
-        continuous_covariate_keys=continuous_covariate_keys,
-        condition_key=condition_key,
-    )

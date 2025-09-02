@@ -104,13 +104,39 @@ class TrainRunner:
 
     def __call__(self):
         """Run training."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info("DEBUG: TrainRunner.__call__() starting")
+        logger.info(f"DEBUG: Data splitter type: {type(self.data_splitter).__name__}")
+        logger.info(f"DEBUG: Training plan type: {type(self.training_plan).__name__}")
+        
         if hasattr(self.data_splitter, "n_train"):
+            logger.info(f"DEBUG: Setting n_obs_training = {self.data_splitter.n_train}")
             self.training_plan.n_obs_training = self.data_splitter.n_train
         if hasattr(self.data_splitter, "n_val"):
+            logger.info(f"DEBUG: Setting n_obs_validation = {self.data_splitter.n_val}")
             self.training_plan.n_obs_validation = self.data_splitter.n_val
 
+        logger.info("DEBUG: About to call trainer.fit() with data_splitter")
+        logger.info(f"DEBUG: Data splitter has train_dataloader: {hasattr(self.data_splitter, 'train_dataloader')}")
+        logger.info(f"DEBUG: Data splitter has val_dataloader: {hasattr(self.data_splitter, 'val_dataloader')}")
+        
+        # Check if data loaders are accessible
         try:
+            if hasattr(self.data_splitter, 'train_dataloader'):
+                train_dl = self.data_splitter.train_dataloader()
+                logger.info(f"DEBUG: Train dataloader created successfully, type: {type(train_dl)}")
+                logger.info(f"DEBUG: Train dataloader length: {len(train_dl) if hasattr(train_dl, '__len__') else 'unknown'}")
+            else:
+                logger.warning("DEBUG: No train_dataloader method found on data_splitter")
+        except Exception as e:
+            logger.error(f"DEBUG: Failed to create train dataloader: {e}")
+        
+        try:
+            logger.info("DEBUG: About to call trainer.fit()")
             self.trainer.fit(self.training_plan, self.data_splitter)
+            logger.info("DEBUG: trainer.fit() completed successfully")
         except NameError:
             import gc
 

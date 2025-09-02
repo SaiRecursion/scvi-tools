@@ -23,7 +23,7 @@ from ._datasets import (
     synthetic_iid,
 )
 from ._manager import AnnDataManager, AnnDataManagerValidationCheck
-from ._phenomics import read_phenomics, setup_phenomics_anndata
+from ._phenomics import read_phenomics_from_df
 from ._preprocessing import (
     add_dna_sequence,
     organize_cite_seq_10x,
@@ -67,5 +67,6 @@ __all__ = [
     "reads_to_fragments",
     "cellxgene",
     "read_phenomics",
+    "read_phenomics_from_df",
     "setup_phenomics_anndata",
 ]

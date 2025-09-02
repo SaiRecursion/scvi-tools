@@ -182,6 +182,29 @@ class Trainer(pl.Trainer):
 
     def fit(self, *args, **kwargs):
         """Fit the model."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info("DEBUG: Trainer.fit() called - starting training setup")
+        logger.info(f"DEBUG: Training arguments: args={len(args)}, kwargs keys={list(kwargs.keys())}")
+        
+        # Log model and datamodule info
+        if len(args) > 0:
+            model = args[0]
+            logger.info(f"DEBUG: Model type: {type(model).__name__}")
+            logger.info(f"DEBUG: Model device: {getattr(model, 'device', 'unknown')}")
+        
+        if len(args) > 1:
+            datamodule = args[1]
+            logger.info(f"DEBUG: DataModule type: {type(datamodule).__name__}")
+        elif 'datamodule' in kwargs:
+            datamodule = kwargs['datamodule']
+            logger.info(f"DEBUG: DataModule type: {type(datamodule).__name__}")
+        else:
+            logger.info("DEBUG: No DataModule provided")
+        
+        logger.info("DEBUG: About to enter warnings context and call super().fit()")
+        
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 action="ignore", category=UserWarning, message="The dataloader,"
@@ -212,7 +235,9 @@ class Trainer(pl.Trainer):
                     message="`LightningModule.configure_optimizers` returned `None`",
                 )
             try:
+                logger.info("DEBUG: About to call PyTorch Lightning super().fit()")
                 super().fit(*args, **kwargs)
+                logger.info("DEBUG: PyTorch Lightning super().fit() completed successfully")
             except NameError:
                 import gc
 
