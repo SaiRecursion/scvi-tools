@@ -50,7 +50,6 @@ def _safe_text(obs, key: str, default: str) -> pd.Series:
     s = s.astype("string")
     return s.fillna(default)
 
-
 # --------------------------------------------------------------------------- #
 # Core loader
 # --------------------------------------------------------------------------- #
@@ -129,9 +128,23 @@ def read_phenomics_from_df(
     if create_perturbation_summary and "map_perturbation_type" in obs.columns:
         pt = obs["map_perturbation_type"].astype(str).str.lower()
         gene = _safe_text(obs, "map_gene", "GENE_UNKNOWN")
-        rec = _safe_text(obs, "map_rec_id", "UNKNOWN_COMPOUND")
-        conc = _safe_text(obs, "map_concentration", "UNKNOWN_CONC")
-        comp = rec.str.cat(conc, sep="_")
+        
+        # Check for missing compound fields
+        if 'map_rec_id' in obs.columns and 'map_concentration' in obs.columns:
+            rec = _safe_text(obs, "map_rec_id", "UNKNOWN_COMPOUND")
+            conc = _safe_text(obs, "map_concentration", "UNKNOWN_CONC")
+            comp = rec.str.cat(conc, sep="_")
+        else:
+            comp = pd.Series(["COMPOUND_UNKNOWN"] * len(obs), index=obs.index, dtype="string")
+            logger.warning("Missing compound fields (map_rec_id/map_concentration) for perturbation summary")
+        
+        # Check for unexpected perturbation types
+        expected_types = {"gene", "compound", "empty"}
+        unique_types = set(pt.unique())
+        unexpected = unique_types - expected_types
+        if unexpected:
+            logger.warning(f"Found unexpected perturbation types: {unexpected}")
+        
         vals = np.select(
             [pt.eq("gene"), pt.eq("compound"), pt.eq("empty")],
             [gene,          comp,              "CONTROL_EMPTY"],
@@ -162,3 +175,38 @@ def read_phenomics_from_df(
         adata.uns["scaler_scale_"] = scaler.scale_.astype("float32")
     logger.info(f"[read_phenomics_from_df] Created AnnData with shape: {adata.shape}")
     return adata
+
+
+def validate_phenomics_distribution(adata):
+    """Check if features follow Gaussian assumptions.
+    
+    Parameters
+    ----------
+    adata
+        AnnData object with phenomics features in X.
+        
+    Notes
+    -----
+    Tests a sample of features using the Shapiro-Wilk test for normality.
+    Warns if more than half of tested features appear non-Gaussian.
+    """
+    from scipy import stats
+    
+    # Sample features to test
+    n_test = min(10, adata.n_vars)
+    sample_indices = np.random.choice(adata.n_vars, n_test, replace=False)
+    
+    non_gaussian_count = 0
+    for idx in sample_indices:
+        feature_data = adata.X[:, idx]
+        # Limit to 1000 samples for Shapiro-Wilk (it has sample size limits)
+        n_samples = min(1000, len(feature_data))
+        _, p_value = stats.shapiro(feature_data[:n_samples])
+        if p_value < 0.05:
+            non_gaussian_count += 1
+    
+    if non_gaussian_count > n_test / 2:
+        logger.warning(
+            f"{non_gaussian_count}/{n_test} tested features appear non-Gaussian. "
+            "Consider using a different likelihood or transforming the data."
+        )

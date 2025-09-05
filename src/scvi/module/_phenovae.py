@@ -250,6 +250,13 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
     adv_batch_weight
         Weight for adversarial batch prediction loss on latent z. When > 0, adds gradient
         reversal to penalize batch information in z. 0.0 = disabled (recommended initially).
+    adv_lambda
+        Gradient reversal scaling factor for adversarial training. Controls the strength
+        of gradient reversal during backpropagation. Default 1.0.
+    use_nll
+        Whether to use full Gaussian negative log-likelihood loss. If False (default), uses
+        a weighted MSE loss that still incorporates learned variance but is more 
+        numerically stable for initial training. Both losses use the learned variance.
     """
 
     def __init__(
@@ -270,6 +277,8 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         recon_beta: float = 1.0,
         batch_embedding_kwargs: Optional[dict] = None,
         adv_batch_weight: float = 0.0,
+        adv_lambda: float = 1.0,
+        use_nll: bool = False,
     ) -> None:
         super().__init__()
 
@@ -283,6 +292,8 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         self.batch_representation = batch_representation
         self.recon_beta = recon_beta
         self.adv_batch_weight = float(adv_batch_weight)
+        self.adv_lambda = float(adv_lambda)
+        self.use_nll = use_nll
 
         # ---- Adversarial batch head on z (with GRL) -------------------------
         if self.adv_batch_weight > 0.0 and self.n_batch > 1:
@@ -293,8 +304,16 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         # ---- Embeddings for batch/condition (decoder-side) -----------------
         # Batch: either embedding (compact) or one-hot (simple).
         if self.batch_representation == "embedding" and self.n_batch > 0:
-            self.init_embedding(REGISTRY_KEYS.BATCH_KEY, n_batch, **(batch_embedding_kwargs or {}))
-            batch_dim = self.get_embedding(REGISTRY_KEYS.BATCH_KEY).embedding_dim
+            batch_embedding_kwargs = batch_embedding_kwargs or {}
+            # Warn if embedding dim is too large relative to n_batch
+            emb_dim = batch_embedding_kwargs.get("embedding_dim", 12)  # scvi default
+            if emb_dim > min(20, n_batch // 50):
+                logger.warning(
+                    f"Batch embedding dim {emb_dim} may be too large for {n_batch} batches. "
+                    f"Consider reducing to {min(16, n_batch // 100)}"
+                )
+            self.init_embedding("batch", n_batch, **batch_embedding_kwargs)
+            batch_dim = self.get_embedding("batch").embedding_dim
         else:
             batch_dim = self.n_batch  # for one-hot concat (0 if no batch)
       
@@ -324,9 +343,11 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
             dec_in_dim += (batch_dim if self.batch_representation == "embedding" else self.n_batch)
 
         use_ln_decoder = use_layer_norm in {"decoder", "both"}
+        # Decoder outputs both mean and log variance (2 * n_input)
+        # Uses chunk approach for consistency with encoder
         self.decoder = ResidualMLP(
             n_in=dec_in_dim,
-            n_out=n_input,
+            n_out=2 * n_input,  # outputs [mean, log_var] chunks
             n_hidden=n_hidden,
             n_layers=n_layers,
             dropout=dropout_rate,
@@ -439,7 +460,8 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         b_rep = None  # Will store batch representation for reuse
         if self.n_batch > 0:
             if self.batch_representation == "embedding":
-                b_rep = self.compute_embedding(REGISTRY_KEYS.BATCH_KEY, batch_index).to(z.dtype)  # [B, E]
+                # Use string literal to avoid scope issues with @auto_move_data
+                b_rep = self.compute_embedding("batch", batch_index).to(z.dtype)  # [B, E]
             else:
                 b_rep = F.one_hot(batch_index, num_classes=self.n_batch).to(z.dtype)  # [B, n_batch]
             dec_inputs.append(_broadcast_like(b_rep, z))
@@ -447,14 +469,17 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
 
         dec_input = torch.cat(dec_inputs, dim=-1)
 
-        px_mean = self.decoder(dec_input)
-
-
-        # --- Simple diagonal Gaussian (temporary - will be replaced with decoder head) ---
-        px_std = torch.ones_like(px_mean)
+        # Decoder outputs both mean and log variance
+        px_params = self.decoder(dec_input)
+        px_mean, px_log_var = px_params.chunk(2, dim=-1)
+        
+        # Constrain variance to reasonable range to prevent instability
+        # For standardized data, allow up to ~5x original variance
+        px_log_var = torch.clamp(px_log_var, min=-10.0, max=3.5)
+        px_std = torch.exp(0.5 * px_log_var)
         px = Normal(px_mean, px_std)
 
-        return {MODULE_KEYS.PX_KEY: px, "px_mean": px_mean}  # expose px_mean for debugging
+        return {MODULE_KEYS.PX_KEY: px, "px_mean": px_mean, "px_log_var": px_log_var}  # expose for debugging
 
     # ----------------------------------------------------------------------
     # Loss
@@ -485,14 +510,39 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         qz = inference_outputs[MODULE_KEYS.QZ_KEY]                   # Normal(mu, std)
         x = tensors[REGISTRY_KEYS.X_KEY].to(px.loc.dtype)           # align dtype with px_mean
 
-        # Reconstruction: negative log likelihood under Gaussian
-        log_likelihood = px.log_prob(x).sum(-1)                     # sum over features -> [B] or [S,B]
-        # If multiple samples, average over the sample dimension first
-        if log_likelihood.dim() == 2:
-            log_likelihood = log_likelihood.mean(0)                 # [S,B] -> [B]
-        reconst_loss = self.recon_beta * (-log_likelihood)
+        # Reconstruction loss: MSE (default) or NLL
+        if self.use_nll:
+            # Negative log likelihood under Gaussian
+            log_likelihood = px.log_prob(x).sum(-1)                 # sum over features -> [B] or [S,B]
+            # If multiple samples, average over the sample dimension first
+            if log_likelihood.dim() == 2:
+                log_likelihood = log_likelihood.mean(0)             # [S,B] -> [B]
+            reconst_loss = self.recon_beta * (-log_likelihood)
+        else:
+            # Weighted MSE that uses learned variance
+            # This is equivalent to Gaussian NLL but more numerically stable
+            mse = F.mse_loss(px.loc, x, reduction='none')          # [B, n_features] or [S, B, n_features]
+            
+            # Get variance info (always present from generative())
+            px_log_var = generative_outputs["px_log_var"]
+            precision = torch.exp(-px_log_var)                 # 1/variance
+            weighted_mse = mse * precision                     # Scale errors by precision
+            log_det = px_log_var                               # log(sigma^2)
+            per_feature_loss = 0.5 * (weighted_mse + log_det)
+                            
+            # Sum over features
+            reconst_loss_per_sample = per_feature_loss.sum(-1)     # [B] or [S,B]
+            
+            # If multiple samples, average over the sample dimension
+            if reconst_loss_per_sample.dim() == 2:
+                reconst_loss_per_sample = reconst_loss_per_sample.mean(0)  # [S,B] -> [B]
+            
+            reconst_loss = self.recon_beta * reconst_loss_per_sample
 
-        var_penalty = torch.tensor(0.0, device=x.device) # arbitrary
+        # Variance regularization to prevent collapse
+        # For standardized data, penalize log_var < -2.0 (std < 0.37)
+        px_log_var = generative_outputs["px_log_var"]
+        var_penalty = 0.1 * torch.mean(torch.relu(-px_log_var - 2.0))
 
         # KL divergence between q(z|x) and N(0, I)
         prior = Normal(loc=torch.zeros_like(qz.loc), scale=torch.ones_like(qz.scale))
@@ -511,7 +561,7 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
             if z_for_adv.dim() == 3:  # [S,B,L] → [B,L]
                 z_for_adv = z_for_adv.mean(0)
             # Reverse encoder gradients only; classifier learns normally
-            z_inv = _GRL.apply(z_for_adv, 1.0)
+            z_inv = _GRL.apply(z_for_adv, self.adv_lambda)
             logits = self._adv_head(z_inv)  # [B, n_batch]
             batch_index = tensors[REGISTRY_KEYS.BATCH_KEY].long().view(-1)
             adv_loss_val = F.cross_entropy(logits, batch_index)

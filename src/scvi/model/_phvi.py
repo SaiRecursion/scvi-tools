@@ -122,6 +122,13 @@ class PHVI(
     adv_batch_weight
         Weight for adversarial batch prediction loss on latent z. When > 0,
         adds a gradient reversal layer that penalizes batch information in z.
+    adv_lambda
+        Gradient reversal scaling factor for adversarial training. Controls the strength
+        of gradient reversal during backpropagation. Default 1.0.
+    use_nll
+        Whether to use full Gaussian negative log-likelihood loss. If False (default), uses
+        a weighted MSE loss that still incorporates learned variance but is more 
+        numerically stable for initial training. Both losses use the learned variance.
     **model_kwargs
         Passed through to the underlying :class:`~scvi.module.PhenoVAE`.
 
@@ -155,6 +162,9 @@ class PHVI(
         recon_beta: float = 1.0,
         # Batch effect mitigation:
         adv_batch_weight: float = 0.0,
+        adv_lambda: float = 1.0,
+        # Loss function:
+        use_nll: bool = False,
         # Any additional kwargs passed straight into the module
         **model_kwargs,
     ):
@@ -175,6 +185,8 @@ class PHVI(
             "use_layer_norm": use_layer_norm,                  # recommended: "encoder"
             "recon_beta": recon_beta,                          # keep β=1.0; use KL anneal in training plan
             "adv_batch_weight": adv_batch_weight,
+            "adv_lambda": adv_lambda,
+            "use_nll": use_nll,
             **model_kwargs,
         }
 
@@ -184,7 +196,8 @@ class PHVI(
             f"  n_hidden={n_hidden}, n_latent={n_latent}, n_layers={n_layers}, dropout={dropout_rate}\n"
             f"  encode_covariates={encode_covariates}, deeply_inject_covariates={deeply_inject_covariates}\n"
             f"  batch_representation={batch_representation}, use_batch_norm={use_batch_norm}, use_layer_norm={use_layer_norm}\n"
-            f"  recon_beta={recon_beta}, adv_batch_weight={adv_batch_weight}\n"
+            f"  recon_beta={recon_beta}, adv_batch_weight={adv_batch_weight}, adv_lambda={adv_lambda}\n"
+            f"  use_nll={use_nll} (loss={'NLL' if use_nll else 'MSE'})\n"
         )
 
         # Discover covariates from the AnnData manager
@@ -212,31 +225,137 @@ class PHVI(
     # --------------------------------------------------------------------- #
     # OPTIONAL utilities
     # --------------------------------------------------------------------- #
-    def get_normalized_expression(
+    def get_reconstruction(
         self,
         adata: AnnData | None = None,
         indices=None,
         n_samples: int = 1,
         batch_size: int | None = None,
     ) -> np.ndarray:
-        """Return denoised/decoded features (mean of Gaussian).
+        """Return reconstructed features using original batch information.
 
-        Notes
-        -----
-        - This returns the decoder's mean (`px.loc`) which is a *denoised*
-          reconstruction in feature space. Use the *latent `z`* for KNN/BMDB maps.
+        This returns the decoder's reconstruction of the input features, conditioned
+        on the original batch of each sample. The reconstruction will still contain
+        batch effects.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with batch info. If None, uses the adata used to train model.
+        indices
+            Indices of cells to use. If None, uses all cells.
+        n_samples
+            Number of posterior samples to use for reconstruction.
+        batch_size
+            Minibatch size for data loading.
+
+        Returns
+        -------
+        Reconstructed feature matrix with same shape as input features.
         """
         from scvi.module._constants import MODULE_KEYS
 
         ad = self._validate_anndata(adata)
         data_loader = self._make_data_loader(adata=ad, indices=indices, batch_size=batch_size)
-        denoised = []
+        reconstructed = []
         for tensors in data_loader:
             inf_out = self.module.inference(**self.module._get_inference_input(tensors), n_samples=n_samples)
             gen_out = self.module.generative(**self.module._get_generative_input(tensors, inf_out))
             px = gen_out[MODULE_KEYS.PX_KEY]  # a torch.distributions.Normal
-            denoised.append(px.loc.detach().cpu().numpy())
-        return np.concatenate(denoised, axis=0)
+            reconstructed.append(px.loc.detach().cpu().numpy())
+        return np.concatenate(reconstructed, axis=0)
+
+    def get_normalized_expression(
+        self,
+        adata: AnnData | None = None,
+        indices=None,
+        n_samples: int = 1,
+        batch_size: int | None = None,
+        reference_batch: int | None = None,
+    ) -> np.ndarray:
+        """Return batch-corrected features by decoding with a reference batch.
+
+        This method encodes the data to get batch-free latent representations,
+        then decodes using a reference batch instead of the original batches.
+        This produces features that are corrected for batch effects.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with batch info. If None, uses the adata used to train model.
+        indices
+            Indices of cells to use. If None, uses all cells.
+        n_samples
+            Number of posterior samples to use for reconstruction.
+        batch_size
+            Minibatch size for data loading.
+        reference_batch
+            Batch index to use for decoding. If None, uses the most common batch.
+
+        Returns
+        -------
+        Batch-corrected feature matrix with same shape as input features.
+        """
+        from scvi.module._constants import MODULE_KEYS
+        import torch
+
+        ad = self._validate_anndata(adata)
+        
+        # Find reference batch if not provided
+        if reference_batch is None:
+            # Get batch information from the adata manager
+            batch_key = self.adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY).get("original_key", None)
+            if batch_key is None:
+                logger.warning("No batch key found in registry, using batch 0 as reference")
+                reference_batch = 0
+            else:
+                # Get the actual batch values from the subset of data we're using
+                if indices is not None:
+                    batch_values = ad.obs[batch_key].iloc[indices]
+                else:
+                    batch_values = ad.obs[batch_key]
+                
+                # Find most common batch
+                most_common_batch_label = batch_values.value_counts().idxmax()
+                # Convert to numeric index using the categorical mapping
+                batch_mapping = self.adata_manager.get_state_registry(REGISTRY_KEYS.BATCH_KEY).get("categorical_mapping", None)
+                if batch_mapping is not None:
+                    # Handle numpy array or list
+                    if hasattr(batch_mapping, 'tolist'):
+                        batch_mapping = batch_mapping.tolist()
+                    reference_batch = batch_mapping.index(most_common_batch_label)
+                else:
+                    logger.warning("No categorical mapping found, using batch 0 as reference")
+                    reference_batch = 0
+                
+                logger.info(f"Using most common batch '{most_common_batch_label}' (index {reference_batch}) as reference")
+        
+        # Process data
+        data_loader = self._make_data_loader(adata=ad, indices=indices, batch_size=batch_size)
+        batch_corrected = []
+        
+        for tensors in data_loader:
+            # Get latent representation (batch-free)
+            inf_out = self.module.inference(**self.module._get_inference_input(tensors), n_samples=n_samples)
+            
+            # Create reference batch tensor
+            batch_tensor = tensors[REGISTRY_KEYS.BATCH_KEY]
+            reference_batch_tensor = torch.full_like(batch_tensor, reference_batch)
+            
+            # Prepare generative inputs with reference batch
+            gen_inputs = {
+                MODULE_KEYS.Z_KEY: inf_out[MODULE_KEYS.Z_KEY],
+                MODULE_KEYS.BATCH_INDEX_KEY: reference_batch_tensor,
+                MODULE_KEYS.CONT_COVS_KEY: tensors.get(REGISTRY_KEYS.CONT_COVS_KEY, None),
+                MODULE_KEYS.CAT_COVS_KEY: tensors.get(REGISTRY_KEYS.CAT_COVS_KEY, None),
+            }
+            
+            # Decode with reference batch
+            gen_out = self.module.generative(**gen_inputs)
+            px = gen_out[MODULE_KEYS.PX_KEY]  # a torch.distributions.Normal
+            batch_corrected.append(px.loc.detach().cpu().numpy())
+        
+        return np.concatenate(batch_corrected, axis=0)
 
     def get_control_anchored_latent_representation(
         self,
