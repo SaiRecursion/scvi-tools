@@ -1,6 +1,6 @@
 """Data loading and AnnData setup utilities for phenomics embeddings.
 
-This module focuses on **clean, fast, and faithful** preparation of phenomics data
+This module focuses on preparation of phenomics data
 for downstream non-linear batch correction with PHVI (a VAE-style model). It:
 
 - Loads a parquet table where feature columns share a prefix (e.g., ``feature_``)
@@ -17,13 +17,6 @@ for downstream non-linear batch correction with PHVI (a VAE-style model). It:
 - Provides a convenience wrapper to register the AnnData with ``scvi.model.PHVI``.
   It forwards a **hierarchical batch** option (e.g., ``experiment × plate_number``),
   which should match how your KNN batch-predictability metric is defined.
-
-Design goals:
--------------
-1) **Speed & scale**: vectorized ops, minimal per-row Python; column-wise extraction.
-2) **Fidelity**: no unintended transformations of the features or implicit filtering.
-3) **Transparency**: explicit logging of dataset shape, feature counts, and basic
-   variance diagnostics to support rapid iteration and debugging.
 
 Typical usage:
 --------------
@@ -42,11 +35,10 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_text(obs, key: str, default: str) -> pd.Series:
+    """Helper function to safely extract text from obs."""
     s = obs.get(key)
     if s is None:
-        # Create a full-length Series so downstream ops have matching index/length
         return pd.Series([default] * len(obs), index=obs.index, dtype="string")
-    # Break out of Categorical first, then fill
     s = s.astype("string")
     return s.fillna(default)
 
@@ -57,7 +49,7 @@ def read_phenomics_from_df(
     df: pd.DataFrame,
     *,
     feature_prefix: str = "feature_",
-    batch_key: str = "plate_number",
+    batch_key: str = "experiment",
     create_perturbation_summary: bool = True,
     standardize: bool = True,
     raw_layer_name: str = "X_raw",
@@ -97,7 +89,6 @@ def read_phenomics_from_df(
     feature_df = df[feature_cols].copy()
     for c in feature_df.columns:
         if pd.api.types.is_categorical_dtype(feature_df[c].dtype):
-            # convert categories to string, then numeric
             feature_df[c] = pd.to_numeric(feature_df[c].astype("string"), errors="coerce")
     X = feature_df.to_numpy(copy=False).astype("float32", copy=False)
     obs = df[meta_cols].copy()
@@ -118,9 +109,6 @@ def read_phenomics_from_df(
         )
         if obs[new_batch_col_name].dtype.name != "category":
             obs[new_batch_col_name] = obs[new_batch_col_name].astype("category")
-        n_levels = obs[new_batch_col_name].nunique()
-        if n_levels <= 1:
-            raise ValueError(f"Hierarchical batch column '{new_batch_col_name}' has {n_levels} level(s).")
         logger.info(f"[read_phenomics_from_df] Using '{new_batch_col_name}' as the final batch key.")
         batch_key = new_batch_col_name
 

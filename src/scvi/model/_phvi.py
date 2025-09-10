@@ -1,34 +1,10 @@
 """Phenomics Variational Inference (PHVI) model.
 
-This file defines a *thin, clean* wrapper around a Phenomics VAE module that
-follows best practices for disentangling **non-linear batch effects** in
-continuous phenomics embeddings (e.g., Phenom2):
+This file defines a wrapper around a Phenomics VAE module
 
-- **Goal**: lower KNN (batch predictability) while increasing BMDB (biological
+- Goal: lower KNN (batch predictability) while increasing BMDB (biological
   recapitulation). TVN (linear) already handled most linear batch; this model
   targets **residual non-linear** effects without washing out true biology.
-
-Principles implemented here
----------------------------
-1) **Train on all wells**: We remove any control-only training behavior.
-   The model needs biological variation to *learn what to preserve*; limiting
-   to controls depresses BMDB.
-
-2) **Batch goes to the DECODER, not the encoder**: The decoder is allowed to
-   condition on batch to reconstruct batch-related nuisance. The encoder does
-   *not* receive batch so the latent `z` does not need to carry it. This reduces
-   batch leakage into `z` (↓KNN) without forcing over-smoothing (↑BMDB).
-
-3) **No BatchNorm; optional LayerNorm in encoder**: BatchNorm interacts with
-   mini-batch composition and can entangle batch signal. We default to no BN
-   and use LayerNorm in the encoder for stability on heterogeneous features.
-
-4) **Gaussian likelihood**: Phenomic features are continuous and the model
-   uses a diagonal Gaussian likelihood for reconstruction.
-
-5) **Keep it simple, iterate quickly**: We drop unstable extras (adversarial
-   training without GRL/two-step optimization, corr-loss, bio-contrastive).
-   You can add a proper GRL+disc later if needed.
 
 Typical usage
 -------------
@@ -125,9 +101,6 @@ class PHVI(
     adv_lambda
         Gradient reversal scaling factor for adversarial training. Controls the strength
         of gradient reversal during backpropagation. Default 1.0.
-    use_nll
-        Whether to use full Gaussian negative log-likelihood loss. If False (default), uses
-        a weighted MSE loss that still incorporates learned variance but is more 
         numerically stable for initial training. Both losses use the learned variance.
     **model_kwargs
         Passed through to the underlying :class:`~scvi.module.PhenoVAE`.
@@ -163,8 +136,6 @@ class PHVI(
         # Batch effect mitigation:
         adv_batch_weight: float = 0.0,
         adv_lambda: float = 1.0,
-        # Loss function:
-        use_nll: bool = False,
         # Any additional kwargs passed straight into the module
         **model_kwargs,
     ):
@@ -186,7 +157,6 @@ class PHVI(
             "recon_beta": recon_beta,                          # keep β=1.0; use KL anneal in training plan
             "adv_batch_weight": adv_batch_weight,
             "adv_lambda": adv_lambda,
-            "use_nll": use_nll,
             **model_kwargs,
         }
 
@@ -197,7 +167,6 @@ class PHVI(
             f"  encode_covariates={encode_covariates}, deeply_inject_covariates={deeply_inject_covariates}\n"
             f"  batch_representation={batch_representation}, use_batch_norm={use_batch_norm}, use_layer_norm={use_layer_norm}\n"
             f"  recon_beta={recon_beta}, adv_batch_weight={adv_batch_weight}, adv_lambda={adv_lambda}\n"
-            f"  use_nll={use_nll} (loss={'NLL' if use_nll else 'MSE'})\n"
         )
 
         # Discover covariates from the AnnData manager
@@ -225,46 +194,6 @@ class PHVI(
     # --------------------------------------------------------------------- #
     # OPTIONAL utilities
     # --------------------------------------------------------------------- #
-    def get_reconstruction(
-        self,
-        adata: AnnData | None = None,
-        indices=None,
-        n_samples: int = 1,
-        batch_size: int | None = None,
-    ) -> np.ndarray:
-        """Return reconstructed features using original batch information.
-
-        This returns the decoder's reconstruction of the input features, conditioned
-        on the original batch of each sample. The reconstruction will still contain
-        batch effects.
-
-        Parameters
-        ----------
-        adata
-            AnnData object with batch info. If None, uses the adata used to train model.
-        indices
-            Indices of cells to use. If None, uses all cells.
-        n_samples
-            Number of posterior samples to use for reconstruction.
-        batch_size
-            Minibatch size for data loading.
-
-        Returns
-        -------
-        Reconstructed feature matrix with same shape as input features.
-        """
-        from scvi.module._constants import MODULE_KEYS
-
-        ad = self._validate_anndata(adata)
-        data_loader = self._make_data_loader(adata=ad, indices=indices, batch_size=batch_size)
-        reconstructed = []
-        for tensors in data_loader:
-            inf_out = self.module.inference(**self.module._get_inference_input(tensors), n_samples=n_samples)
-            gen_out = self.module.generative(**self.module._get_generative_input(tensors, inf_out))
-            px = gen_out[MODULE_KEYS.PX_KEY]  # a torch.distributions.Normal
-            reconstructed.append(px.loc.detach().cpu().numpy())
-        return np.concatenate(reconstructed, axis=0)
-
     def get_normalized_expression(
         self,
         adata: AnnData | None = None,
@@ -356,36 +285,6 @@ class PHVI(
             batch_corrected.append(px.loc.detach().cpu().numpy())
         
         return np.concatenate(batch_corrected, axis=0)
-
-    def get_control_anchored_latent_representation(
-        self,
-        adata: AnnData | None = None,
-        indices=None,
-        control_key: str = "is_control",
-        control_value: bool = True,
-        batch_size: int | None = None,
-    ) -> np.ndarray:
-        """Return latent `z` after subtracting the control centroid (optional viz trick).
-
-        This is a light post-hoc centering that can help visualization or shave
-        a bit of residual batch when controls are well-distributed across batches.
-        **Do not** anchor during training—train on *all* wells.
-        """
-        ad = self._validate_anndata(adata)
-        z = self.get_latent_representation(adata=ad, indices=indices, batch_size=batch_size)
-
-        if control_key not in ad.obs:
-            logger.warning(f"[get_control_anchored_latent_representation] '{control_key}' not in adata.obs; returning raw latent.")
-            return z
-
-        obs_subset = ad.obs.iloc[indices] if indices is not None else ad.obs
-        mask = (obs_subset[control_key] == control_value).to_numpy()
-        if not np.any(mask):
-            logger.warning(f"[get_control_anchored_latent_representation] No rows with {control_key}={control_value}; returning raw latent.")
-            return z
-
-        control_centroid = z[mask].mean(axis=0, keepdims=True)
-        return z - control_centroid
 
     # --------------------------------------------------------------------- #
     # AnnData registration
