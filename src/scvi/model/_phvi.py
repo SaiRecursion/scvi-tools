@@ -70,7 +70,7 @@ class PHVI(
     Parameters
     ----------
     adata
-        AnnData registered via :meth:`~scvi.model.PHVI.setup_anndata`.
+        AnnData registered via `scvi.model.PHVI.setup_anndata`.
     n_hidden
         Width of the MLP hidden layers.
     n_latent
@@ -95,13 +95,6 @@ class PHVI(
     recon_beta
         Weight on reconstruction loss. Keep β=1.0 and use KL annealing instead of
         detuning β (avoids over-compression harming BMDB).
-    adv_batch_weight
-        Weight for adversarial batch prediction loss on latent z. When > 0,
-        adds a gradient reversal layer that penalizes batch information in z.
-    adv_lambda
-        Gradient reversal scaling factor for adversarial training. Controls the strength
-        of gradient reversal during backpropagation. Default 1.0.
-        numerically stable for initial training. Both losses use the learned variance.
     **model_kwargs
         Passed through to the underlying :class:`~scvi.module.PhenoVAE`.
 
@@ -133,9 +126,6 @@ class PHVI(
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "encoder",
         # Likelihood/regularization:
         recon_beta: float = 1.0,
-        # Batch effect mitigation:
-        adv_batch_weight: float = 0.0,
-        adv_lambda: float = 1.0,
         # Any additional kwargs passed straight into the module
         **model_kwargs,
     ):
@@ -155,8 +145,6 @@ class PHVI(
             "use_batch_norm": use_batch_norm,                  # recommended: "none"
             "use_layer_norm": use_layer_norm,                  # recommended: "encoder"
             "recon_beta": recon_beta,                          # keep β=1.0; use KL anneal in training plan
-            "adv_batch_weight": adv_batch_weight,
-            "adv_lambda": adv_lambda,
             **model_kwargs,
         }
 
@@ -166,7 +154,7 @@ class PHVI(
             f"  n_hidden={n_hidden}, n_latent={n_latent}, n_layers={n_layers}, dropout={dropout_rate}\n"
             f"  encode_covariates={encode_covariates}, deeply_inject_covariates={deeply_inject_covariates}\n"
             f"  batch_representation={batch_representation}, use_batch_norm={use_batch_norm}, use_layer_norm={use_layer_norm}\n"
-            f"  recon_beta={recon_beta}, adv_batch_weight={adv_batch_weight}, adv_lambda={adv_lambda}\n"
+            f"  recon_beta={recon_beta}\n"
         )
 
         # Discover covariates from the AnnData manager

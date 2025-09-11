@@ -73,7 +73,7 @@ def read_phenomics_from_df(
         Name for storing raw (unstandardized) features in layers.
     hierarchical_batch_keys
         If provided, must be a list of exactly two keys in df columns to be
-        concatenated into a hierarchical batch key. This mirrors (experiment × plate)
+        concatenated into a hierarchical batch key. This mirrors (experiment x plate)
         which is what KNN evaluators typically use. Example: ['experiment', 'plate_number'].
         If provided, this overrides the batch_key parameter.
         

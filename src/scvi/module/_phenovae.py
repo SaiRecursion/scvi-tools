@@ -3,7 +3,7 @@
 UNDERSTAND
 ----------
 We are aligning high-dimensional phenomics embeddings (Phenom2) across ~3k
-batch combinations (experiment × plate). Our two metrics are:
+batch combinations (experiment x plate). Our two metrics are:
 - **KNN batch predictability** (lower is better; chance ≈ 0.033%).
 - **BMDB biological recapitulation** (higher is better).
 
@@ -29,7 +29,7 @@ ANALYZE / DESIGN CHOICES
 
 4) **Loss: reconstruction + KL (with annealing via plan)**
    - Keep β=1.0 and rely on a training-plan KL schedule (scvi handles `kl_weight`).
-   - Remove unstable/contradictory extras (no adversarial/corr/bio-contrastive).
+   - Remove unstable/contradictory extras (no corr/bio-contrastive).
 
 5) **Capacity defaults**:
    - `n_latent=128`, `n_hidden=256`, `n_layers=2`, `dropout=0.1`.
@@ -84,20 +84,6 @@ if TYPE_CHECKING:
     from typing import Literal
 
 logger = logging.getLogger(__name__)
-
-# -----------------------------------------------------------------------------
-# Gradient Reversal Layer for adversarial training
-# -----------------------------------------------------------------------------
-class _GRL(Function):
-    """Gradient Reversal Layer for adversarial batch prediction."""
-    @staticmethod
-    def forward(ctx, x, lambd: float):
-        ctx.lambd = float(lambd)
-        return x.view_as(x)
-    
-    @staticmethod
-    def backward(ctx, grad):
-        return -ctx.lambd * grad, None
 
 # -----------------------------------------------------------------------------
 # Helper function for broadcasting tensors
@@ -247,12 +233,6 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         Weight on reconstruction loss. Keep at 1.0; rely on KL annealing instead.
     batch_embedding_kwargs
         Extra kwargs for batch embedding layer (if `batch_representation="embedding"`).
-    adv_batch_weight
-        Weight for adversarial batch prediction loss on latent z. When > 0, adds gradient
-        reversal to penalize batch information in z. 0.0 = disabled (recommended initially).
-    adv_lambda
-        Gradient reversal scaling factor for adversarial training. Controls the strength
-        of gradient reversal during backpropagation. Default 1.0.
     """
 
     def __init__(
@@ -272,8 +252,6 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "encoder",
         recon_beta: float = 1.0,
         batch_embedding_kwargs: Optional[dict] = None,
-        adv_batch_weight: float = 0.0,
-        adv_lambda: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -286,21 +264,6 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         self.deeply_inject_covariates = deeply_inject_covariates  # not used internally
         self.batch_representation = batch_representation
         self.recon_beta = recon_beta
-        self.adv_batch_weight = float(adv_batch_weight)
-        self.adv_lambda = float(adv_lambda)
-
-        # ---- Adversarial batch head on z (with GRL) -------------------------
-        if self.n_batch > 1:
-            self._adv_head = ResidualMLP(
-                n_in=n_latent,
-                n_out=self.n_batch,
-                n_hidden=64, 
-                n_layers=2,   
-                dropout=0.0,  # No dropout for classifier (focus on detection, not generalization)
-                use_layer_norm=False,  # No LN (simple classification; LN could over-stabilize)
-            )
-        else:
-            self._adv_head = None
 
         # ---- Embeddings for batch/condition (decoder-side) -----------------
         # Batch: either embedding (compact) or one-hot (simple).
@@ -399,14 +362,6 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
             - MODULE_KEYS.QZ_KEY: Normal(loc=mu, scale=sigma)
             - MODULE_KEYS.Z_KEY: rsample(s) from q(z|x)
         """
-        # Basic sanity for batch indices (protect against out-of-bounds)
-        if self.n_batch > 0:
-            b = batch_index.long().view(-1)
-            if b.numel() > 0 and (b.max() >= self.n_batch or b.min() < 0):
-                raise ValueError(
-                    f"batch_index out of bounds: min={int(b.min())}, max={int(b.max())}, n_batch={self.n_batch}"
-                )
-
         enc_inputs = [x]
 
         # Optional continuous covariates concatenation (keep minimal by default).
@@ -436,10 +391,6 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         """Decoder forward pass producing p(x|z, batch, covs). Batch **is used here**."""
         # --- validate + normalize index shapes ---
         batch_index = batch_index.long().view(-1)  # [B]
-        if self.n_batch > 0 and (batch_index.max() >= self.n_batch or batch_index.min() < 0):
-            raise ValueError(
-                f"batch_index out of bounds: max={batch_index.max()}, min={batch_index.min()}, n_batch={self.n_batch}"
-            )
 
         dec_inputs: list[torch.Tensor] = [z]
         # We keep cat_covs for API parity, but do not inject them into the decoder.
@@ -460,7 +411,6 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
                 b_rep = F.one_hot(batch_index, num_classes=self.n_batch).to(z.dtype)  # [B, n_batch]
             dec_inputs.append(_broadcast_like(b_rep, z))
 
-
         dec_input = torch.cat(dec_inputs, dim=-1)
 
         # Decoder outputs both mean and log variance
@@ -469,7 +419,7 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         
         # Constrain variance to reasonable range to prevent instability
         # For standardized data, allow up to ~5x original variance
-        px_log_var = torch.clamp(px_log_var, min=-10.0, max=3.5)
+        px_log_var = torch.clamp(px_log_var, min=-5.0, max=2.0)
         px_std = torch.exp(0.5 * px_log_var)
         px = Normal(px_mean, px_std)
 
@@ -488,7 +438,7 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
     ) -> LossOutput:
         """Standard VAE loss for continuous phenomics: recon + KL
 
-        We *intentionally* keep this simple and stable. KL annealing should be
+        We keep this simple and stable. KL annealing should be
         handled by the training plan through the `kl_weight` argument, which
         scvi-tools passes here (e.g., linear/sigmoid ramp from 0→1).
 
@@ -516,54 +466,24 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
         # Variance regularization to prevent collapse
         # For standardized data, penalize log_var < -2.0 (std < 0.37)
         px_log_var = generative_outputs["px_log_var"]
-        # var_penalty = 1.0 * torch.mean(torch.relu(-px_log_var - 2.0))
+        # var_regularization = 1.0 * torch.mean(torch.relu(-px_log_var - 2.0))
         var_regularization = 0.01 * torch.mean((px_log_var - 0.0)**2)
 
         # KL divergence between q(z|x) and N(0, I)
         prior = Normal(loc=torch.zeros_like(qz.loc), scale=torch.ones_like(qz.scale))
-        kl_div_z = torch.distributions.kl_divergence(qz, prior).sum(dim=1)
+        kl_div_z = torch.distributions.kl_divergence(qz, prior).mean(dim=1)
 
         # Let training plan drive annealing via kl_weight
         effective_kl_weight = float(kwargs.get("kl_weight", kl_weight))
 
         total = reconst_loss.mean() + effective_kl_weight * kl_div_z.mean() + var_regularization
 
-        # ---- Optional adversarial loss to remove batch from z ---------------
-        adv_w = float(self.adv_batch_weight or 0.0)
-        adv_loss_val = torch.tensor(0.0, device=x.device)
-        if adv_w > 0.0 and self._adv_head is not None and self.n_batch > 1:
-            z_for_adv = inference_outputs[MODULE_KEYS.Z_KEY]
-            if z_for_adv.dim() == 3:  # [S,B,L] → [B,L]
-                z_for_adv = z_for_adv.mean(0)
-            # Reverse encoder gradients only; classifier learns normally
-            z_inv = _GRL.apply(z_for_adv, self.adv_lambda)
-            logits = self._adv_head(z_inv)  # [B, n_batch]
-            self._last_adv_logits = logits.detach()  # Store for metric computation
-            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY].long().view(-1)
-            adv_loss_val = F.cross_entropy(logits, batch_index)
-            total = total + adv_w * adv_loss_val
-
         # Compute only essential metrics during training (keep it fast!)
-        # Most metrics are now computed in the monitor at epoch end
-        with torch.no_grad():
-            # Only compute cheap, essential metrics here
-            z = inference_outputs[MODULE_KEYS.Z_KEY]
-            if z.dim() == 3:  # [S, B, L]
-                z_for_metrics = z.mean(0)  # [B, L]
-            else:
-                z_for_metrics = z
-            
+        with torch.no_grad():      
             # Quick reconstruction quality check (cheap)
             px_mean = px.loc
             residual = x - px_mean
             mse = (residual ** 2).mean()
-            
-            # Only compute batch accuracy if adversarial is active (reuses existing computation)
-            batch_pred_acc = torch.tensor(0.0, device=x.device)
-            if adv_w > 0.0 and self._adv_head is not None and self.n_batch > 1 and hasattr(self, "_last_adv_logits"):
-                # Reuse logits from adversarial loss computation
-                batch_pred = self._last_adv_logits.argmax(dim=1)
-                batch_pred_acc = (batch_pred == batch_index).float().mean()
         
         return LossOutput(
             loss=total,
@@ -574,12 +494,10 @@ class PhenoVAE(EmbeddingModuleMixin, BaseModuleClass):
                 "kl_weight": torch.tensor(effective_kl_weight, device=x.device),
                 "reconst_mean": reconst_loss.mean(),
                 "kl_mean": kl_div_z.mean(),
-                "adv_loss": adv_loss_val,
                 "var_penalty": var_regularization,
                 
                 # Only the most essential diagnostic metrics
                 "recon_mse": mse,
-                "batch_pred_acc": batch_pred_acc,
             },
         )
 
